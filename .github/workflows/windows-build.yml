@@ -34,7 +34,11 @@ jobs:
 
   build:
     needs: poll
-    if: needs.poll.outputs.snapshot != ''
+    if: >-
+      needs.poll.outputs.snapshot != '' &&
+      github.repository == 'dc0d32/wezterm-builds' &&
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: windows-2025
     timeout-minutes: 180
     permissions:
@@ -45,15 +49,84 @@ jobs:
       SNAPSHOT: ${{ needs.poll.outputs.snapshot }}
       CARGO_INCREMENTAL: '0'
       RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
+      BUILD_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ github.sha }}
           path: control
           persist-credentials: false
-      - name: Compile, check and package exact upstream commit
+      - name: Prepare fresh source and cache identity (no restored inputs)
+        id: prepare
         shell: pwsh
-        run: ./control/scripts/build.ps1
+        run: ./control/scripts/build.ps1 -Phase Prepare
+      - name: Restore crates.io downloads only
+        id: registry
+        uses: ./control/.github/actions/cache-restore
+        with:
+          path: .cargo-build/registry/cache
+          key: ${{ steps.prepare.outputs.registry_key }}
+          restore-keys: ${{ steps.prepare.outputs.registry_restore }}
+      - name: Restore untrusted compiled dependencies
+        id: target
+        uses: ./control/.github/actions/cache-restore
+        with:
+          path: candidate/target
+          key: ${{ steps.prepare.outputs.target_key }}
+          restore-keys: ${{ steps.prepare.outputs.target_restore }}
+      - name: Restore isolated pinned Nextest executable
+        id: nextest
+        uses: ./control/.github/actions/cache-restore
+        with:
+          path: .nextest/bin
+          key: ${{ steps.prepare.outputs.nextest_key }}
+      - name: Compile, check and package exact upstream commit
+        id: compile
+        shell: pwsh
+        env:
+          NEXTEST_CACHE_MATCHED: ${{ steps.nextest.outputs.cache-matched-key }}
+        run: ./control/scripts/build.ps1 -Phase Compile
+      - name: Save successful build caches only
+        if: >-
+          success() && steps.compile.outcome == 'success' &&
+          github.repository == 'dc0d32/wezterm-builds' &&
+          github.ref_name == github.event.repository.default_branch &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        shell: pwsh
+        run: python -B control/scripts/build_cache.py validate
+      - name: Save crates.io downloads
+        if: >-
+          success() && steps.compile.outcome == 'success' &&
+          steps.registry.outputs.cache-hit != 'true' &&
+          github.repository == 'dc0d32/wezterm-builds' &&
+          github.ref_name == github.event.repository.default_branch &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .cargo-build/registry/cache
+          key: ${{ steps.prepare.outputs.registry_key }}
+      - name: Save compiled dependencies
+        if: >-
+          success() && steps.compile.outcome == 'success' &&
+          steps.target.outputs.cache-hit != 'true' &&
+          github.repository == 'dc0d32/wezterm-builds' &&
+          github.ref_name == github.event.repository.default_branch &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: candidate/target
+          key: ${{ steps.prepare.outputs.target_key }}
+      - name: Save isolated Nextest executable
+        if: >-
+          success() && steps.compile.outcome == 'success' &&
+          steps.nextest.outputs.cache-hit != 'true' &&
+          github.repository == 'dc0d32/wezterm-builds' &&
+          github.ref_name == github.event.repository.default_branch &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: .nextest/bin
+          key: ${{ steps.prepare.outputs.nextest_key }}
       - id: upload
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:

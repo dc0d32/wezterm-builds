@@ -1,0 +1,21 @@
+name: Prevalidated Windows cache restore
+description: Download cache v2 into isolation and promote only validated cache files
+inputs:
+  path:
+    description: Exact approved cache path
+    required: true
+  key:
+    description: Prepared primary key
+    required: true
+  restore-keys:
+    description: Single prepared fallback prefix, if allowed
+    required: false
+    default: ''
+outputs:
+  cache-hit:
+    description: True only for an exact primary hit
+  cache-matched-key:
+    description: Validated matched key or empty on a miss
+runs:
+  using: node20
+  main: index.js

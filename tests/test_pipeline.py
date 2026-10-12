@@ -24,6 +24,9 @@ ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location("pipeline_under_test", ROOT / "scripts/pipeline.py")
 pipeline = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pipeline)
+CACHE_SPEC = importlib.util.spec_from_file_location("cache_under_test", ROOT / "scripts/build_cache.py")
+build_cache = importlib.util.module_from_spec(CACHE_SPEC)
+CACHE_SPEC.loader.exec_module(build_cache)
 
 SOURCE = "a1234567" + "89abcdef" * 4
 HEAD = "b" * 40
@@ -1120,6 +1123,201 @@ class VisibilityTests(unittest.TestCase):
             case.doCleanups()
 
 
+class BuildCacheTests(WorkspaceCase):
+    def setUp(self):
+        super().setUp()
+        self.identity = {
+            "os": "Windows", "arch": "X64", "target": "x86_64-pc-windows-msvc",
+            "rustc": "rustc 1.90.0\nhost: x86_64-pc-windows-msvc",
+            "cargo": "cargo 1.90.0\nhost: x86_64-pc-windows-msvc",
+            "image_os": "win25", "image_version": "20261005.1.0",
+            "native": "cl/link:sha256", "environment": {"LIB": "sdk", "RUSTFLAGS": None},
+        }
+        self.scripts = {"scripts/build.ps1": "a" * 64, "scripts/build_cache.py": "b" * 64}
+        self.lock = b"version = 4\n"
+
+    def plan(self, **kwargs):
+        args = dict(identity=self.identity, lock=self.lock, source=SOURCE, scripts=self.scripts)
+        args.update(kwargs)
+        return build_cache.cache_plan(**args)
+
+    def write_cache(self, relative, content=b"fixture"):
+        path = self.work / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def test_keys_are_deterministic_and_bounded(self):
+        plan = self.plan()
+        reordered = dict(reversed(list(self.identity.items())))
+        self.assertEqual(plan, self.plan(identity=reordered))
+        self.assertEqual(set(plan), {
+            "registry_key", "registry_restore", "target_key", "target_restore", "nextest_key",
+        })
+        for key, value in plan.items():
+            self.assertLess(len(value), 512)
+            self.assertRegex(value, r"^wt-win-v1-Windows-X64-[0-9a-f]{64}-")
+            self.assertNotIn("\n", value)
+        self.assertTrue(plan["target_key"].endswith(
+            hashlib.sha256(self.lock).hexdigest() + "-" + SOURCE))
+
+    def test_weekly_source_reuse_never_drops_environment_or_lock(self):
+        old, new = self.plan(), self.plan(source="d" * 40)
+        for kind in ("registry", "target"):
+            self.assertNotEqual(old[kind + "_key"], new[kind + "_key"])
+            self.assertTrue(old[kind + "_key"].startswith(new[kind + "_restore"]))
+        self.assertEqual(old["nextest_key"], new["nextest_key"])
+        changed = self.plan(lock=self.lock + b"# changed")
+        self.assertFalse(old["target_key"].startswith(changed["target_restore"]))
+        self.assertTrue(old["registry_key"].startswith(changed["registry_restore"]))
+        self.assertEqual(old["nextest_key"], changed["nextest_key"])
+
+    def test_all_environment_changes_invalidate_all_cache_families(self):
+        old = self.plan()
+        for field in ("rustc", "cargo", "native", "image_os", "image_version", "environment"):
+            value = copy.deepcopy(self.identity)
+            if field == "environment":
+                value[field]["CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS"] = "-C target-cpu=native"
+            else:
+                value[field] += "\nchanged"
+            with self.subTest(field=field):
+                new = self.plan(identity=value)
+                for kind in ("registry", "target"):
+                    self.assertFalse(old[kind + "_key"].startswith(new[kind + "_restore"]))
+                self.assertNotEqual(old["nextest_key"], new["nextest_key"])
+
+    def test_build_script_and_nextest_version_invalidation(self):
+        old = self.plan()
+        changed = self.plan(scripts=dict(self.scripts, additional="c" * 64))
+        for kind in ("registry", "target", "nextest"):
+            self.assertNotEqual(old[kind + "_key"], changed[kind + "_key"])
+        versioned = self.plan(nextest_version="0.9.115")
+        self.assertNotEqual(old["nextest_key"], versioned["nextest_key"])
+        self.assertEqual(old["target_key"], versioned["target_key"])
+
+    def test_bad_identity_source_and_missing_material_fail_closed(self):
+        for field in self.identity:
+            value = copy.deepcopy(self.identity)
+            del value[field]
+            with self.subTest(missing=field), self.assertRaises(ValueError):
+                self.plan(identity=value)
+        for field, bad in (("os", "Linux"), ("arch", "ARM64"), ("target", "other"),
+                           ("rustc", "rustc\nhost: other"), ("cargo", ""), ("environment", {})):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.plan(identity=dict(self.identity, **{field: bad}))
+        for invalid in (SOURCE[:8], SOURCE.upper(), "g" * 40, SOURCE + "\n"):
+            with self.assertRaises(ValueError):
+                self.plan(source=invalid)
+        for kwargs in ({"lock": b""}, {"scripts": {}}, {"nextest_version": "latest"}):
+            with self.assertRaises(ValueError):
+                self.plan(**kwargs)
+
+    def test_missing_caches_and_allowed_files_are_normal(self):
+        build_cache.validate_cache(self.work)
+        self.write_cache(".cargo-build/registry/cache/index.crates.io-1949cf8c6b5b557f/serde-1.0.0.crate")
+        self.write_cache("candidate/target/release/deps/libserde.rlib")
+        self.write_cache("candidate/target/debug/deps/serde.exe")
+        self.write_cache(".nextest/bin/cargo-nextest.exe")
+        build_cache.validate_cache(self.work)
+
+    def test_registry_configuration_extracted_sources_and_other_registries_rejected(self):
+        root = self.work / build_cache.PATHS["registry"]
+        for entry in ("config.toml", "credentials.toml", "index.crates.io-abc/config.json",
+                      "other-registry-abc/foo-1.crate", "index.crates.io-abc/src/lib.rs",
+                      "index.crates.io-abc/.cargo-checksum.json"):
+            path = self.write_cache(str(Path(build_cache.PATHS["registry"]) / entry))
+            with self.subTest(entry=entry), self.assertRaises(ValueError):
+                build_cache.validate_cache(self.work)
+            path.unlink()
+        shutil.rmtree(root)
+
+    def test_nextest_receipts_config_wrong_tool_empty_and_directories_rejected(self):
+        root = self.work / build_cache.PATHS["nextest"]
+        for entry in (".crates.toml", ".crates2.json", "config.toml", "cargo-other.exe"):
+            self.write_cache(str(Path(build_cache.PATHS["nextest"]) / entry))
+            with self.subTest(entry=entry), self.assertRaises(ValueError):
+                build_cache.validate_cache(self.work)
+            shutil.rmtree(root)
+        self.write_cache(".nextest/bin/cargo-nextest.exe", b"")
+        with self.assertRaises(ValueError):
+            build_cache.validate_cache(self.work)
+        shutil.rmtree(root)
+        (root / "extra").mkdir(parents=True)
+        with self.assertRaises(ValueError):
+            build_cache.validate_cache(self.work)
+
+    def test_empty_nextest_hit_fails_but_empty_miss_installs_normally(self):
+        build_cache.validate_cache(self.work, nextest_hit=False)
+        with self.assertRaisesRegex(ValueError, "missing its executable"):
+            build_cache.validate_cache(self.work, nextest_hit=True)
+        self.write_cache(".nextest/bin/cargo-nextest.exe")
+        build_cache.validate_cache(self.work, nextest_hit=True)
+
+    def test_windows_reparse_points_are_rejected_on_ancestor_and_file(self):
+        file = self.write_cache("candidate/target/release/deps/libserde.rlib")
+        original = Path.lstat
+        for poisoned in (self.work / "candidate", file):
+            def fake_lstat(path, *args, **kwargs):
+                info = original(path, *args, **kwargs)
+                if path == poisoned:
+                    return mock.Mock(st_mode=info.st_mode, st_file_attributes=0x400)
+                return info
+            with mock.patch.object(Path, "lstat", fake_lstat):
+                with self.subTest(path=poisoned), self.assertRaises(ValueError):
+                    build_cache.validate_cache(self.work)
+
+    def test_cache_links_and_ancestor_links_rejected_before_traversal(self):
+        destination = self.work / "not-cached"
+        destination.mkdir()
+        for relative in build_cache.PATHS.values():
+            path = self.work / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(destination, target_is_directory=True)
+            with self.subTest(path=relative), self.assertRaises(ValueError):
+                build_cache.validate_cache(self.work)
+            path.unlink()
+        parent = self.work / ".nextest"
+        parent.rmdir()
+        parent.symlink_to(destination, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            build_cache.validate_cache(self.work)
+        parent.unlink()
+        self.write_cache("candidate/target/file")
+        (self.work / "candidate/target/link").symlink_to(destination, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            build_cache.validate_cache(self.work)
+
+    def test_nextest_version_check_rejects_wrong_or_corrupt_output(self):
+        for output in ("cargo-nextest 0.9.114", "cargo-nextest 0.9.114 (abcdef123 2026-10-01)"):
+            build_cache.validate_nextest_version(output)
+        for output in ("", "nextest 0.9.114", "cargo-nextest 0.9.113",
+                       "cargo-nextest 0.9.114-extra", "cargo-nextest 0.9.114\nerror"):
+            with self.subTest(output=output), self.assertRaises(ValueError):
+                build_cache.validate_nextest_version(output)
+
+    def test_prepare_verify_and_changed_lock_fixture(self):
+        self.write_cache(".build-identity.json", json.dumps(self.identity).encode())
+        self.write_cache("candidate/Cargo.lock", self.lock)
+        for name in ("scripts/build.ps1", "scripts/build_cache.py", "scripts/cache_restore.py",
+                     ".github/actions/cache-restore/action.yml",
+                     ".github/actions/cache-restore/index.js", ".github/workflows/windows-build.yml"):
+            self.write_cache("control/" + name)
+        output = self.work / "step-output"
+        os.environ["GITHUB_OUTPUT"] = str(output)
+        os.environ["SNAPSHOT"] = json.dumps(snapshot())
+        with mock.patch.object(build_cache.sys, "argv", ["build_cache.py", "prepare"]):
+            build_cache.main()
+        plan = json.loads((self.work / ".build-cache-plan.json").read_text())
+        outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        self.assertEqual(outputs.pop("nextest_version"), build_cache.NEXTEST_VERSION)
+        self.assertEqual(outputs, plan)
+        with mock.patch.object(build_cache.sys, "argv", ["build_cache.py", "verify"]):
+            build_cache.main()
+            (self.work / "candidate/Cargo.lock").write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                build_cache.main()
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = (ROOT / WORKFLOW).read_text(encoding="utf-8")
@@ -1138,14 +1336,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("github.ref_name == github.event.repository.default_branch", self.workflow)
         self.assertIn("cancel-in-progress: false", self.workflow)
 
-    def test_all_actions_are_exact_reviewed_commit_pins(self):
+    def test_remote_actions_are_reviewed_pins_and_restore_is_local(self):
         actions = re.findall(r"uses: ([^\s#]+)", self.workflow)
-        self.assertEqual(len(actions), 4)
+        self.assertEqual(len(actions), 10)
         allowed = {
             "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
             "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            "./control/.github/actions/cache-restore",
+            "actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830",
         }
         self.assertEqual(set(actions), allowed)
+        self.assertEqual(actions.count("./control/.github/actions/cache-restore"), 3)
+        self.assertEqual(actions.count("actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830"), 3)
+        self.assertNotIn("actions/cache/restore@", self.workflow)
         self.assertEqual(self.workflow.count("persist-credentials: false"), 3)
         self.assertEqual(self.workflow.count("ref: ${{ github.sha }}"), 3)
 
@@ -1160,30 +1363,30 @@ class WorkflowTests(unittest.TestCase):
                       "-${{ github.run_id }}-${{ github.run_attempt }}", self.build)
         script = (ROOT / "scripts/build.ps1").read_text(encoding="utf-8")
         self.assertIn("https://github.com/wezterm/wezterm.git", script)
-        self.assertIn("checkout --detach FETCH_HEAD", script)
-        self.assertIn("submodule update --init --recursive", script)
+        self.assertIn("'checkout', '--detach', 'FETCH_HEAD'", script)
+        self.assertIn("'submodule', 'update', '--init', '--recursive'", script)
         self.assertIn("protocol.allow=never", script)
         self.assertIn("protocol.https.allow=always", script)
-        self.assertIn("cargo build --locked --release", script)
-        self.assertIn("cargo nextest run --locked --all --no-fail-fast", script)
+        self.assertIn("Invoke-Checked cargo @('build', '--locked', '--release'", script)
+        self.assertIn("Invoke-Checked $nextest @('nextest', 'run', '--locked', '--all', '--no-fail-fast')", script)
         self.assertNotIn("--all-targets", script)
         self.assertIn(".tag", script)
         self.assertIn("ci/deploy.sh", script)
 
     def test_build_uses_upstream_nextest_without_skipping_ssh(self):
         script = (ROOT / "scripts/build.ps1").read_text(encoding="utf-8")
-        self.assertIn("cargo install cargo-nextest --locked", script)
-        self.assertLess(script.index("cargo install cargo-nextest --locked"),
+        self.assertIn("'install', 'cargo-nextest', '--locked', '--version', \"=$nextestVersion\"", script)
+        self.assertLess(script.index("'install', 'cargo-nextest'"),
                         script.index("Push-Location candidate"))
-        self.assertIn("cargo nextest run --locked --all --no-fail-fast", script)
+        self.assertIn("'nextest', 'run', '--locked', '--all', '--no-fail-fast'", script)
         for forbidden in ("cargo test ", "--exclude", "--skip", "--run-ignored",
-                          "Remove-Item", "rm -rf", "wezterm-ssh/tests"):
+                          "rm -rf", "wezterm-ssh/tests"):
             self.assertNotIn(forbidden, script)
 
     def test_build_keeps_upstream_crt_config_and_packaging_dependencies(self):
         script = (ROOT / "scripts/build.ps1").read_text(encoding="utf-8")
-        self.assertIn("cargo vendor --locked --versioned-dirs | "
-                      "Out-File -Append -Encoding utf8 .cargo/config.toml", script)
+        self.assertIn("Invoke-Checked cargo @('vendor', '--locked', '--versioned-dirs') |", script)
+        self.assertIn("Out-File -Append -Encoding utf8 .cargo/config.toml", script)
         self.assertIn(r"C:\Strawberry\perl\bin", script)
         self.assertIn(r"C:\Program Files\Inno Setup 6", script)
         self.assertIn(r"C:\Program Files\Git\bin\bash.exe", script)
@@ -1198,8 +1401,79 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("path: control", self.publish)
         self.assertIn("python3 -B control/scripts/pipeline.py publish", self.publish)
         self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", self.publish)
-        for forbidden in ("cargo ", "deploy.sh", "upstream", "candidate/", "download-artifact@"):
+        for forbidden in ("cargo ", "deploy.sh", "upstream", "candidate/", "download-artifact@",
+                          "actions/cache", ".cargo-build", ".nextest", "build_cache.py"):
             self.assertNotIn(forbidden, self.publish)
+
+    def test_restore_and_save_have_only_the_three_narrow_paths(self):
+        paths = {"registry": ".cargo-build/registry/cache", "target": "candidate/target",
+                 "nextest": ".nextest/bin"}
+        self.assertEqual(paths, build_cache.PATHS)
+        restore, save = [], []
+        for block in self.build.split("      - name: ")[1:]:
+            if ("uses: actions/cache/save@" not in block
+                    and "uses: ./control/.github/actions/cache-restore" not in block):
+                continue
+            path = re.search(r"^          path: (.+)$", block, re.M).group(1)
+            kind = next(kind for kind, value in paths.items() if value == path)
+            self.assertIn("${{ steps.prepare.outputs." + kind + "_key }}", block)
+            if "uses: ./control/.github/actions/cache-restore" in block:
+                restore.append(path)
+                self.assertIn(f"id: {kind}", block)
+                if kind == "nextest":
+                    self.assertNotIn("restore-keys:", block)
+                else:
+                    self.assertIn("restore-keys: ${{ steps.prepare.outputs." + kind + "_restore }}", block)
+            else:
+                save.append(path)
+                for gate in ("success()", "steps.compile.outcome == 'success'",
+                             "github.repository == 'dc0d32/wezterm-builds'",
+                             "github.ref_name == github.event.repository.default_branch",
+                             "github.event_name == 'schedule'", "github.event_name == 'workflow_dispatch'",
+                             f"steps.{kind}.outputs.cache-hit != 'true'"):
+                    self.assertIn(gate, block)
+        self.assertCountEqual(restore, paths.values())
+        self.assertCountEqual(save, paths.values())
+        self.assertNotIn("continue-on-error", self.build)
+
+    def test_fresh_prepare_precedes_restore_and_compile_precedes_save(self):
+        prepare = self.build.index("-Phase Prepare")
+        compile_step = self.build.index("-Phase Compile")
+        restores = list(re.finditer(r"uses: \./control/\.github/actions/cache-restore", self.build))
+        self.assertEqual(len(restores), 3)
+        for match in restores:
+            self.assertLess(prepare, match.start())
+            self.assertLess(match.start(), compile_step)
+        for match in re.finditer("uses: actions/cache/save@", self.build):
+            self.assertLess(compile_step, match.start())
+        for gate in ("github.repository == 'dc0d32/wezterm-builds'",
+                     "github.ref_name == github.event.repository.default_branch",
+                     "github.event_name == 'schedule'", "github.event_name == 'workflow_dispatch'"):
+            self.assertIn(gate, self.build.split("    runs-on:", 1)[0])
+
+    def test_script_rechecks_identity_tool_and_forces_local_source_recompile(self):
+        script = (ROOT / "scripts/build.ps1").read_text()
+        self.assertIn('$env:GITHUB_REF -cne "refs/heads/$env:BUILD_DEFAULT_BRANCH"', script)
+        self.assertIn("$PSNativeCommandUseErrorActionPreference = $true", script)
+        self.assertIn("$env:RUSTUP_TOOLCHAIN = 'stable'", script)
+        self.assertIn("if ($LASTEXITCODE -ne 0)", script)
+        verify = script.index("'control/scripts/build_cache.py', 'verify'")
+        install = script.index("'install', 'cargo-nextest'")
+        check = script.index("'check-nextest-version', $toolVersion")
+        clean = script.index("'clean', '--package', $package.id")
+        build = script.index("'build', '--locked', '--release'")
+        self.assertLess(verify, install)
+        self.assertLess(check, clean)
+        self.assertLess(clean, build)
+        self.assertIn("if ($null -eq $package.source)", script)
+        self.assertIn("Stale workspace executable", script)
+        self.assertIn("Nextest cache hit is missing its executable", script)
+        self.assertIn("'--root', (Join-Path $root '.nextest-install')", script)
+        self.assertIn("'--target-dir', (Join-Path $root '.nextest-install/target')", script)
+        self.assertIn("Copy-Item '.nextest-install/bin/cargo-nextest.exe' $nextest", script)
+        self.assertNotIn("catch", script)
+        self.assertLess(script.index("'control/scripts/pipeline.py', 'package'"),
+                        script.rindex("'control/scripts/build_cache.py', 'validate'"))
 
 
 if __name__ == "__main__":

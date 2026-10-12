@@ -4,3 +4,8 @@ package/
 incoming/
 .test-work/
 artifact.zip
+.cargo-build/
+.nextest/
+.nextest-install/
+.build-identity.json
+.build-cache-plan.json

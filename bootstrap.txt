@@ -15,7 +15,10 @@ Owner bootstrap (manual; not performed by the agent)
    repository secret, upstream credential or repository-dispatch token is
    required. Use GitHub-hosted runners, not self-hosted runners.
 3. Settings > Actions > General: enable Actions and allow the SHA-pinned
-   actions/checkout and actions/upload-artifact. The default workflow token
+   actions/checkout, actions/upload-artifact and actions/cache/save ONLY.
+   Restore uses a dependency-free local node20 action from the trusted control
+   checkout, not actions/cache/restore or the combined actions/cache action.
+   The default workflow token
    may remain read-only: only publish requests contents: write and actions:
    read. No PR creation permission is required or used here.
 4. Settings > General > Releases: enable "Release immutability".
@@ -52,6 +55,125 @@ tests/.test-work and cleaned after each test. On Windows Python is supplied by
 windows-2025 and the build uses PowerShell 7, Git bash, stable Rust/MSVC,
 Strawberry Perl, 7-Zip and Inno Setup 6 from the hosted runner image.
 The Windows build itself must be verified with a real GitHub Actions run.
+
+Windows build caches (build job only)
+-------------------------------------
+Prepare runs BEFORE any cache restore: anonymous exact public source/submodule
+checkout, .tag from the source date, stable Rust resolution, and explicit x64
+MSVC/SDK environment resolution. It hashes the actual candidate Cargo.lock,
+full upstream source SHA, rustc/cargo -vV (including host), Windows OS/arch/target,
+hosted ImageOS/ImageVersion, cl/link binary hashes, compiler/Cargo environment,
+and trusted build/restore/helper/local-action/workflow bytes. Compile recomputes that identity
+after restore and fails if it changed. Default-branch and schedule/manual gates
+are explicit in the build job, both script phases and every cache-save step.
+RUSTUP_TOOLCHAIN=stable explicitly keeps candidate toolchain files from silently
+selecting a different compiler than the rustc/cargo identity prepared for caches.
+
+Exactly three paths are cached, with separate immutable keys:
+  .cargo-build/registry/cache  crates.io .crate downloads only; environment-scoped
+                              fallback permits reuse across source/lock changes
+  candidate/target            release AND debug dependencies; fallback retains
+                              full environment scope AND exact Cargo.lock hash
+  .nextest/bin                ONLY cargo-nextest.exe; exact environment/toolchain
+                              and pinned 0.9.114 key, with no fallback
+Registry/target exact keys additionally include the full 40-character upstream
+source SHA and Cargo.lock hash. No OS-only, Rust-only or branch-only fallback.
+Changing the build scripts/workflow bumps every environment scope. New image,
+native compiler, Rust/Cargo, flags or SDK identities intentionally cause misses.
+
+Only SAVE uses actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830
+(v4.3.0). Restore uses a dependency-free local node20 action which launches
+python -B control/scripts/cache_restore.py. Runtime cache credentials are passed
+only to that child process: never to logs, action outputs, GITHUB_ENV, or compile.
+The helper requires ACTIONS_CACHE_SERVICE_V2=true and implements the internal
+v2 API contract compatible with @actions/cache 4.1.0; this is not a public,
+stable API guarantee. GetCacheEntryDownloadURL uses POST to the fixed runtime
+cache service origin and fixed
+/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL path,
+with Bearer runtime-token authentication. Its cache version
+hash uses the literal cache path, zstd-without-long, windows-only, and 1.0,
+matching the pinned save implementation with cross-OS archives disabled.
+Hosted zstd must be present and functional; there is no alternate decompressor
+or silent cold-build fallback for a broken decoder. The signed blob download
+sends no runtime/API credentials and follows no redirects.
+Runtime origins are restricted to results-receiver.actions.githubusercontent.com
+or pipeline.actions.githubusercontent.com (including subdomains); downloads to
+blob.core.windows.net backends only. These restrictions target GitHub.com hosted
+Windows x64 runners, not GHES, custom cache backends or cross-OS archives.
+
+Restore bounds compressed downloads to 10 GiB, expanded archives to 30 GiB,
+and tar member count to 300,000. Streaming download/decompression has timeouts,
+and zstd's decoder window is capped at 128 MiB. The ENTIRE tar is validated
+before materializing members in a private stage inside the workspace. Paths,
+entry types, collisions and link targets are checked before manual file copies;
+only safe in-root hardlinks are supported, never unrestricted tar extraction.
+Shape checks run on the staged tree before promotion of ONLY the approved cache
+root. File mtimes are preserved for Cargo reuse, but arbitrary archive mode
+metadata is not applied. No cache member may overwrite source/control/config
+files or escape its approved root.
+Raw header checks require valid framing and zero-only trailing padding before
+tarfile parsing. Global PAX headers are unsupported and rejected before their
+payloads are read: tarfile otherwise copies their fields into every member,
+amplifying memory use. The pinned save action's GNU tar --posix uses local PAX
+entries. Supported extensions are limited to 1 MiB each, 64 MiB total and 16
+consecutive headers; PAX size overrides/sparse data are unsupported. Path length
+is limited to 32,767 characters and depth to 128 components. Scratch archives
+and private staging trees are removed on both success and ordinary failures.
+
+The service can return a prefix match even for a primary-key lookup. Every
+returned key must match the prepared exact key or its intended registry/target
+fallback scope; Nextest requires exact equality only. Only a genuine absent
+entry is a cold-build miss. Authentication, transport, timeout, decompression,
+archive, key or shape failures fail restore and the job, never turn into misses.
+
+No whole Cargo home, registry index/extracted sources, .cargo/git db/checkouts,
+Git/Cargo configs/credentials, vendor/source trees, rustup, trusted control
+checkout, or Cargo install receipts are cached. Cargo home is isolated per run.
+Registry downloads are consumed through Cargo's locked checksum verification
+and fresh unpacking/vendoring; never restore an extracted Cargo source/config.
+Restored roots, ancestors and entries are checked for links/junctions/reparse
+points and special files before cached data is used, and again before saving.
+Unexpected registry/tool entries fail closed. Archive/path gates constrain
+materialization, not executable behavior; these checks are not a sandbox.
+
+On a Nextest miss, cargo install uses --locked --version =0.9.114 and an explicit
+fresh .nextest-install root/target outside candidate, then copies only the EXE
+and removes install state. A hit is not accepted on presence alone: its expected
+tool/version is checked by execution ONLY inside the token-free compile phase.
+Wrong version, empty/absent executable on a hit, invalid shape, or nonzero native
+exit fails the build; no reinstall-on-corruption or success-shaped fallback.
+
+Compiled target artifacts and Nextest are UNTRUSTED EXECUTABLE INPUTS, not
+integrity-verified outputs. A malicious cache can run build scripts/test/tool
+code and can affect binaries; version checks do not authenticate executable
+contents. Anyone able to publish malicious cache data inside an accepted scope
+can compromise this disposable build job, just like malicious upstream code.
+Cache keys/fresh workspace cleaning prevent accidental stale reuse, NOT that
+attack. Malicious upstream code can poison executable caches despite all gates.
+The job has no injected repository API token, write token or secrets; runtime
+cache authentication belongs to job infrastructure, not a repository write
+token. Compile strips cache/artifact API variables from its environment before
+executing candidate code; this does not make the disposable job a credential
+sandbox or remove its inherent runner service access. The publisher
+never restores any caches, executes cached inputs, or trusts a cache as proof.
+Provenance still identifies exact source/workflow/run, not a cache-free rebuild.
+
+Before release compilation and debug Nextest tests, cargo metadata --locked
+identifies ALL local/path packages (including version and submodule crates);
+cargo clean --package clears their artifacts/fingerprints in BOTH profiles.
+Any remaining final package EXE is an error before cargo build. Thus a target
+hit cannot skip local source/.tag recompilation just because restored timestamps
+look fresh. Third-party dependencies remain eligible for Cargo's reuse checks.
+Locked vendoring, four release binaries, --locked --all --no-fail-fast Nextest,
+upstream deployment and package/provenance validation are mandatory on every run.
+There is no sccache/setup action: target reuse needs no additional compiler
+wrapper/download, and also covers MSVC outputs and debug test dependencies.
+Genuine cache misses trigger a cold build, not build success. Pinned save's
+network failures are nonfatal warnings; restore failures are fatal. Neither
+behavior suppresses compile/test/package native command failures. Save runs
+only after the ENTIRE compile/test/package step
+succeeds and revalidates the cache paths. Exact hits are not re-saved. GitHub cache
+eviction/quota or hosted-image/toolchain changes can force a full rebuild.
 
 Request contract / coordinator handoff
 --------------------------------------
@@ -150,7 +272,11 @@ Security boundaries and unavoidable limits
 poll: anonymous public HTTP reads only, read-only default-branch checkout.
 build: fresh Windows VM, contents: read, persist-credentials: false; exact
 upstream clone plus recursive submodules, no GITHUB_TOKEN/secret in the build
-environment; no credential persistence, write token or shared build cache.
+environment; no credential persistence or write token. Only the narrowly scoped
+untrusted caches described above are restored/saved in this job.
+Runtime cache authentication is job infrastructure, not repository write access:
+the local restore action passes it only to its Python child, never outputs or
+GITHUB_ENV, and compile strips API variables before running candidate code.
 Upstream Cargo build scripts, tests and deploy.sh execute ONLY here.
 publish: separate Ubuntu VM; fresh trusted build-repo checkout at workflow
 head SHA; never checks out nixos PR or upstream, and never executes ZIP data.
@@ -176,7 +302,7 @@ the retry mechanism. Anonymous API rate limits can delay work.
 Rust stable, Windows runner tools and Cargo dependencies are not vendored
 into this service: this is provenance-addressed, not a bit-reproducible build.
 No claim of Windows code signing or upstream tests' malicious-code safety.
-Do not add a write token, cache-save privilege, external secrets, PR trigger,
+Do not add a write token, cache access, external secrets, PR trigger,
 repository_dispatch trigger or upstream checkout to publish.
 
 Reviewed upstream and action metadata
@@ -187,7 +313,7 @@ Its ci/deploy.ps1 does not exist; the anonymous history query returns []:
     https://api.github.com/repos/wezterm/wezterm/commits?path=ci/deploy.ps1&per_page=1
 The actual Windows workflows build four Rust binaries, vendor locked Cargo
 dependencies, test, and run bash ci/deploy.sh. We use Cargo's lib/bin/integration
-test targets rather than Nextest, without compiling benchmark targets: the
+test targets through Nextest, without compiling benchmark targets: the
 bootstrap revision's wcwidth benchmark has undeclared criterion/termwiz
 dependencies. We follow the upstream packaging route, including
 the required DLLs, PDB, Mesa runtime and upstream ZIP root; an EXE installer
@@ -218,8 +344,27 @@ ALL actions used (full commit SHAs; no moving tags):
     commit verified=true; release v4.6.2 merge (#685).
     Source reviewed: deletion is gated on overwrite; false never deletes:
     https://raw.githubusercontent.com/actions/upload-artifact/ea165f8d65b6e75b540449e92b4886f43607fa02/src/upload/upload-artifact.ts
-No download/setup/cache/Rust third-party action is used: trusted Python safely
+    actions/cache/save ONLY v4.3.0
+    0057852bfaa89a56745cba8c7296529d2fc39830
+    https://raw.githubusercontent.com/actions/cache/0057852bfaa89a56745cba8c7296529d2fc39830/save/action.yml
+    Pin/version metadata verified separately by the reviewing agent. No
+    actions/cache/restore or combined action's post-job save is used.
+    Local restore action: dependency-free node20 launcher for
+    python -B control/scripts/cache_restore.py from the trusted control checkout.
+    Its internal v2 protocol/version compatibility target is @actions/cache 4.1.0,
+    including GetCacheEntryDownloadURL and the literal path/compression/platform/
+    salt version inputs described above; hosted compatibility remains unverified.
+No download/setup/Rust third-party action is used: trusted Python safely
 downloads the own-repo artifact, and the hosted image supplies build tools.
+
+Nextest pin reviewed from upstream release metadata:
+    cargo-nextest 0.9.114, workspace rust-version 1.88
+    https://raw.githubusercontent.com/nextest-rs/nextest/cargo-nextest-0.9.114/cargo-nextest/Cargo.toml
+    https://raw.githubusercontent.com/nextest-rs/nextest/cargo-nextest-0.9.114/Cargo.toml
+    https://raw.githubusercontent.com/nextest-rs/nextest/cargo-nextest-0.9.114/cargo-nextest/src/version.rs
+The exact Cargo install version is pinned; --locked preserves that release's
+dependency lock. Its optional short commit/date version suffix is supported.
+Updating this pin invalidates Nextest keys (and the helper hash environment scope).
 
 GitHub immutability/API references:
     https://docs.github.com/en/rest/releases/releases#create-a-release
@@ -235,13 +380,27 @@ Hosted Windows tool inventory reviewed:
 Implementation verification (2026-10-11)
 ---------------------------------------
     python3 -B -m unittest discover -s tests -q
-    Result: 62 tests passed, including mocked full publication, race rejection,
+    Original baseline: 64 tests passed. Final cache change: 153 tests passed,
+    including 73 offline restore regressions and real installed-zstd round-trip
+    decompression/manual restoration with safe hardlinks and preserved mtimes.
+    Tests cover malicious sibling source/config writes, archive framing/metadata
+    limits, Windows paths/collisions/links, bounded decoding/watchdog cleanup,
+    API failure versus miss, known version hashes, narrow key matching, runtime
+    credential separation, and generic action errors. Security review findings
+    were addressed: unsafe extraction was replaced, and global PAX metadata
+    amplification is rejected before tarfile parsing.
+    Existing fixtures continue to cover executable
+    cache-key/weekly-reuse/environment/lock/version invalidation fixtures,
+    prepare/verify identity checks, cache path/link/config rejection, default
+    branch/save gates and publisher isolation, plus mocked full publication,
+    race rejection,
     source dedup across request identities, rerun naming, run/attempt proof,
     ZIP/path/CRC/checksum validation, atomic tag creation races, tag/run binding,
     bounded CDN retries and token boundaries.
     No prior repository/test suite existed in this initially absent directory.
     Initial regression failures were corrected before the final passing run.
-    Ruby's installed YAML parser: workflow parsed successfully; exact job set
+    Ruby's installed YAML parser: workflow and local action parsed successfully;
+    node20 action declaration and JavaScript syntax checked; exact job set
     poll/build/publish and read-only build/write-only publish permissions verified.
     Python ast.parse: all Python files passed.
     Byte scan: all persisted files LF; no fixtures, __pycache__ or artifact.zip
@@ -254,3 +413,5 @@ Not performed: Windows compilation/PowerShell execution (Darwin host lacks
 pwsh/MSVC), hosted workflow or actual release, remote creation, git commit,
 git push, or any changes to the source repository or its active pins.
 End-to-end hosted verification requires the owner's manual bootstrap.
+The internal v2 endpoint is source-compatible with the pinned save bundle, but
+no authenticated hosted cache-service request or hosted save/restore was run.
