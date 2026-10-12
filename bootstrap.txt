@@ -1,7 +1,8 @@
 dc0d32/wezterm-builds — public, Windows-only build service
 =========================================================
 
-This directory is a complete repository payload, not an activated deployment.
+This directory is a complete dual-architecture Windows repository payload, not
+an activated deployment.
 The empty public dc0d32/wezterm-builds repository has been created with owner
 approval. No commit, push or release has been published.
 
@@ -15,7 +16,8 @@ Owner bootstrap (manual; not performed by the agent)
    repository secret, upstream credential or repository-dispatch token is
    required. Use GitHub-hosted runners, not self-hosted runners.
 3. Settings > Actions > General: enable Actions and allow the SHA-pinned
-   actions/checkout, actions/upload-artifact and actions/cache/save ONLY.
+   actions/checkout, actions/upload-artifact, actions/download-artifact and
+   actions/cache/save ONLY.
    Restore uses a dependency-free local node20 action from the trusted control
    checkout, not actions/cache/restore or the combined actions/cache action.
    The default workflow token
@@ -51,17 +53,19 @@ Local verification (Python >= 3.9; stdlib only)
 -----------------------------------------------
     python3 -B -m unittest discover -s tests -v
 No fixture uses tempfile, mktemp or /tmp. Fixtures are UUID directories under
-tests/.test-work and cleaned after each test. On Windows Python is supplied by
-windows-2025 and the build uses PowerShell 7, Git bash, stable Rust/MSVC,
-Strawberry Perl, 7-Zip and Inno Setup 6 from the hosted runner image.
-The Windows build itself must be verified with a real GitHub Actions run.
+tests/.test-work and cleaned after each test. On Windows Python is supplied by windows-2025 and windows-11-arm. Builds use
+PowerShell 7, stable Rust/MSVC and hosted image tools. The x64 build alone also
+uses Git bash, Strawberry Perl, 7-Zip and Inno Setup 6 for upstream packaging.
+The Windows builds and native ARM64 validation must be verified with a real
+GitHub Actions run.
 
 Windows build caches (build job only)
 -------------------------------------
 Prepare runs BEFORE any cache restore: anonymous exact public source/submodule
-checkout, .tag from the source date, stable Rust resolution, and explicit x64
-MSVC/SDK environment resolution. It hashes the actual candidate Cargo.lock,
-full upstream source SHA, rustc/cargo -vV (including host), Windows OS/arch/target,
+checkout, .tag from the source date, stable Rust resolution, and explicit
+x64-host/x64-target or x64-host/ARM64-target MSVC/SDK environment resolution.
+It hashes the actual candidate Cargo.lock, full upstream source SHA,
+rustc/cargo -vV (including host), Windows OS/runner-arch/compile-target,
 hosted ImageOS/ImageVersion, cl/link binary hashes, compiler/Cargo environment,
 and trusted build/restore/helper/local-action/workflow bytes. Compile recomputes that identity
 after restore and fails if it changed. Default-branch and schedule/manual gates
@@ -69,14 +73,17 @@ are explicit in the build job, both script phases and every cache-save step.
 RUSTUP_TOOLCHAIN=stable explicitly keeps candidate toolchain files from silently
 selecting a different compiler than the rustc/cargo identity prepared for caches.
 
-Exactly three paths are cached, with separate immutable keys:
+The x64 job caches exactly three paths; ARM64 caches only the first two:
   .cargo-build/registry/cache  crates.io .crate downloads only; environment-scoped
                               fallback permits reuse across source/lock changes
   candidate/target            release AND debug dependencies; fallback retains
                               full environment scope AND exact Cargo.lock hash
-  .nextest/bin                ONLY cargo-nextest.exe; exact environment/toolchain
-                              and pinned 0.9.114 key, with no fallback
-Registry/target exact keys additionally include the full 40-character upstream
+  .nextest/bin                x64 ONLY cargo-nextest.exe; exact
+                              environment/toolchain and pinned 0.9.114 key
+The target triple and compiler environment are part of every cache scope, and
+the visible key family is Windows-X64 or Windows-ARM64. Therefore no primary or
+fallback key can cross architectures. Registry/target exact keys additionally
+include the full 40-character upstream
 source SHA and Cargo.lock hash. No OS-only, Rust-only or branch-only fallback.
 Changing the build scripts/workflow bumps every environment scope. New image,
 native compiler, Rust/Cargo, flags or SDK identities intentionally cause misses.
@@ -158,14 +165,25 @@ sandbox or remove its inherent runner service access. The publisher
 never restores any caches, executes cached inputs, or trusts a cache as proof.
 Provenance still identifies exact source/workflow/run, not a cache-free rebuild.
 
-Before release compilation and debug Nextest tests, cargo metadata --locked
+Before release compilation and tests, cargo metadata --locked
 identifies ALL local/path packages (including version and submodule crates);
 cargo clean --package clears their artifacts/fingerprints in BOTH profiles.
 Any remaining final package EXE is an error before cargo build. Thus a target
 hit cannot skip local source/.tag recompilation just because restored timestamps
 look fresh. Third-party dependencies remain eligible for Cargo's reuse checks.
-Locked vendoring, four release binaries, --locked --all --no-fail-fast Nextest,
-upstream deployment and package/provenance validation are mandatory on every run.
+Locked vendoring and four release binaries are mandatory on every run. x64
+retains native --locked --all --no-fail-fast Nextest and upstream deploy.sh
+packaging unchanged on windows-2025. ARM64 uses the
+aarch64-pc-windows-msvc target, VS x64-host/arm64-target tools and
+-Ctarget-feature=+crt-static, and compiles all tests with cargo test --no-run on
+the x64 windows-2025 runner. It never runs upstream deploy.sh.
+
+ARM64 packaging is a control-plane allowlist built directly from
+target/aarch64-pc-windows-msvc/release: wezterm.exe, wezterm-gui.exe,
+wezterm-mux-server.exe, strip-ansi-escapes.exe, plus only their same-basename
+PDBs when generated. Every executable is parsed as PE/COFF and must have machine
+0xAA64. The archive cannot contain conpty.dll, OpenConsole.exe, ANGLE, Mesa or
+any other DLL/file. The publisher independently repeats these checks.
 There is no sccache/setup action: target reuse needs no additional compiler
 wrapper/download, and also covers MSVC outputs and debug test dependencies.
 Genuine cache misses trigger a cold build, not build success. Pinned save's
@@ -204,23 +222,28 @@ Public release contract
 ------------------------
     build_id = source_sha + "-" + run_id + "-" + run_attempt
     tag      = "wezterm-" + build_id
-    archive  = "WezTerm-windows-" + build_id + ".zip"
-There are exactly three release assets: archive, provenance.json, SHA256SUMS.
-SHA256SUMS contains exactly: "<archive-sha256>  <archive-name>\n".
+    x64 archive = "WezTerm-windows-x86_64-" + build_id + ".zip"
+    ARM archive = "WezTerm-windows-aarch64-" + build_id + ".zip"
+There are exactly four release assets: both archives, provenance.json and
+SHA256SUMS. SHA256SUMS has one "<sha256>  <name>\n" line per archive, sorted by
+architecture key (aarch64 then x86_64).
 
-provenance.json contains the REQUIRED coordinator fields:
-    schema=1, source_repository="wezterm/wezterm", source_sha,
+provenance.json contains:
+    schema=2, source_repository="wezterm/wezterm", source_sha,
     build_repository="dc0d32/wezterm-builds", run_id (positive integer),
-    run_attempt (positive integer), build_id, version, archive_root,
-    asset_name, sha256 (lowercase hex), size (positive integer), success=true.
-Additional provenance keys: request_id, requested_at, nonce (the same values
-as the accepted request). No new coordinator-required manifest fields.
+    run_attempt (positive integer), build_id, version, success=true,
+    request_id, requested_at and nonce (the accepted request values), and:
+    assets.windows.x86_64
+    assets.windows.aarch64
+Each architecture object has exactly name, architecture, archive_root, sha256
+(lowercase hex), and size (positive integer). The x86_64 root remains
+"WezTerm-windows-" + version; the aarch64 root is
+"WezTerm-windows-aarch64-" + version.
 
 version is the upstream timestamp tag format YYYYMMDD-HHMMSS-<short-sha8>,
 derived from the exact upstream committer date, explicitly normalized to UTC.
-It is written to upstream's .tag before compilation. archive_root is
-"WezTerm-windows-" + version, not the source/run/attempt build_id.
-The outer asset is renamed without rewriting upstream's ZIP.
+It is written to upstream's .tag before compilation. The x64 outer asset is renamed without rewriting upstream's ZIP. ARM64 is
+independently assembled from the target-specific release directory.
 
 The coordinator must accept an existing successful release for the SAME
 source_sha even when its request_id differs. It should check manifest,
@@ -234,7 +257,8 @@ Run provenance expected by coordinator:
     head_repository.full_name: "dc0d32/wezterm-builds"
     head_branch: repository's default branch
     run_id/run_attempt: manifest's exact numeric values
-    job "build": completed, conclusion success, same run_attempt
+    jobs "build-x64", "build-arm64" and "validate-arm64": each completed,
+    conclusion success, same run_attempt
     job "publish": publisher (never upstream code)
 The publisher checks this proof before publication. The release can become
 visible while publish is running. The coordinator MUST wait for that run
@@ -270,14 +294,21 @@ rerun all jobs for a new attempt. Never delete a successful release to retry.
 Security boundaries and unavoidable limits
 -------------------------------------------
 poll: anonymous public HTTP reads only, read-only default-branch checkout.
-build: fresh Windows VM, contents: read, persist-credentials: false; exact
+build-x64/build-arm64: separate fresh windows-2025 VMs, contents: read,
+persist-credentials: false; exact
 upstream clone plus recursive submodules, no GITHUB_TOKEN/secret in the build
 environment; no credential persistence or write token. Only the narrowly scoped
 untrusted caches described above are restored/saved in this job.
 Runtime cache authentication is job infrastructure, not repository write access:
 the local restore action passes it only to its Python child, never outputs or
 GITHUB_ENV, and compile strips API variables before running candidate code.
-Upstream Cargo build scripts, tests and deploy.sh execute ONLY here.
+Upstream Cargo build scripts execute only here; native tests and deploy.sh run
+only in build-x64.
+validate-arm64: fresh native windows-11-arm VM, contents/actions read only and
+no secrets/write token. It revalidates the artifact and PE machines, then runs
+all four executables' version/help surfaces, strip filtering, a real console
+child through WezTerm's ConPTY path, and a WebGpu GUI startup/renderer smoke.
+Publication requires this job's success.
 publish: separate Ubuntu VM; fresh trusted build-repo checkout at workflow
 head SHA; never checks out nixos PR or upstream, and never executes ZIP data.
 Its own GITHUB_TOKEN addresses only allowlisted dc0d32/wezterm-builds API
@@ -285,12 +316,15 @@ routes; external nixos/wezterm/release reads are anonymous, and redirects
 strip Authorization. Own artifact downloads use actions: read.
 
 The publisher checks the artifact ID/name/run/head SHA, safely unpacks only
-the three allowed top-level files, validates JSON keys/types/identity, archive
+the two allowed files from each build artifact, validates JSON
+keys/types/identity, archive
 SHA256/size and SHA256SUMS, and scans every ZIP entry and CRC without extraction.
 It rejects traversal/absolute paths/backslashes/ADS/Windows device names,
 duplicate or case-colliding entries, symlinks/special entries, encrypted or
-unsupported compression, unexpected roots/missing runtime files and size
-bombs. It rechecks the PR/request before download, before drafting and
+unsupported compression, unexpected roots/missing runtime files, ARM64
+allowlists/machine types and size bombs. It creates the combined schema-2
+manifest and checksums itself. It rechecks the PR/request before download,
+before drafting and
 immediately before the draft-to-public transition. A superseded draft stays
 unpublished. GitHub APIs offer no atomic cross-repository "publish only if PR
 still open" transaction: there is an irreducible interval after the final
@@ -344,6 +378,12 @@ ALL actions used (full commit SHAs; no moving tags):
     commit verified=true; release v4.6.2 merge (#685).
     Source reviewed: deletion is gated on overwrite; false never deletes:
     https://raw.githubusercontent.com/actions/upload-artifact/ea165f8d65b6e75b540449e92b4886f43607fa02/src/upload/upload-artifact.ts
+    actions/download-artifact v5
+    634f93cb2916e3fdff6788551b99b062d0335ce0
+    https://api.github.com/repos/actions/download-artifact/commits/634f93cb2916e3fdff6788551b99b062d0335ce0
+    Used only by the token-free native ARM64 validation job with the exact
+    current-run artifact ID. Trusted pipeline.py then validates its two-file
+    output before any candidate executable runs.
     actions/cache/save ONLY v4.3.0
     0057852bfaa89a56745cba8c7296529d2fc39830
     https://raw.githubusercontent.com/actions/cache/0057852bfaa89a56745cba8c7296529d2fc39830/save/action.yml
@@ -374,21 +414,26 @@ GitHub immutability/API references:
     https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json
 The last two document the admin-read prerequisite for immutability preflight;
 we deliberately do not widen publication's token permissions.
-Hosted Windows tool inventory reviewed:
+Hosted Windows x64 tool inventory reviewed:
     https://raw.githubusercontent.com/actions/runner-images/main/images/windows/Windows2025-Readme.md
+Native ARM64 validation uses the public-repository windows-11-arm hosted label.
 
 Implementation verification (2026-10-11)
 ---------------------------------------
     python3 -B -m unittest discover -s tests -q
-    Original baseline: 64 tests passed. Final cache change: 153 tests passed,
+    Original baseline: 153 tests passed. Dual-architecture change: 156 tests passed,
     including 73 offline restore regressions and real installed-zstd round-trip
     decompression/manual restoration with safe hardlinks and preserved mtimes.
     Tests cover malicious sibling source/config writes, archive framing/metadata
     limits, Windows paths/collisions/links, bounded decoding/watchdog cleanup,
-    API failure versus miss, known version hashes, narrow key matching, runtime
+    API failure versus miss, known version hashes, architecture-disjoint key
+    matching, runtime
     credential separation, and generic action errors. Security review findings
     were addressed: unsafe extraction was replaced, and global PAX metadata
     amplification is rejected before tarfile parsing.
+    Dual-architecture fixtures additionally cover schema-2 manifests, two
+    immutable archive assets, ARM64 PE 0xAA64 enforcement, forbidden DLLs,
+    native-validation publication gating and exact build-artifact identity.
     Existing fixtures continue to cover executable
     cache-key/weekly-reuse/environment/lock/version invalidation fixtures,
     prepare/verify identity checks, cache path/link/config rejection, default
@@ -399,9 +444,10 @@ Implementation verification (2026-10-11)
     bounded CDN retries and token boundaries.
     No prior repository/test suite existed in this initially absent directory.
     Initial regression failures were corrected before the final passing run.
-    Ruby's installed YAML parser: workflow and local action parsed successfully;
+    Ruby's installed YAML parser: workflow (including aliases) and local action
+    parsed successfully;
     node20 action declaration and JavaScript syntax checked; exact job set
-    poll/build/publish and read-only build/write-only publish permissions verified.
+    poll/build-x64/build-arm64/validate-arm64/publish and least permissions verified.
     Python ast.parse: all Python files passed.
     Byte scan: all persisted files LF; no fixtures, __pycache__ or artifact.zip
     remained after tests.
@@ -410,7 +456,8 @@ Implementation verification (2026-10-11)
     Real public Actions API run/job samples confirmed path and run_attempt fields.
 
 Not performed: Windows compilation/PowerShell execution (Darwin host lacks
-pwsh/MSVC), hosted workflow or actual release, remote creation, git commit,
+pwsh/MSVC), native ARM64/ConPTY/WebGpu execution, hosted workflow or actual
+release, remote creation, git commit,
 git push, or any changes to the source repository or its active pins.
 End-to-end hosted verification requires the owner's manual bootstrap.
 The internal v2 endpoint is source-compatible with the pinned save bundle, but

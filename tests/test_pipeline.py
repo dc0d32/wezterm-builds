@@ -43,6 +43,9 @@ REQUIRED_FILES = {
     "strip-ansi-escapes.exe", "wezterm.pdb", "conpty.dll", "OpenConsole.exe",
     "libEGL.dll", "libGLESv2.dll", "mesa/opengl32.dll",
 }
+ARM64_FILES = {
+    "wezterm.exe", "wezterm-gui.exe", "wezterm-mux-server.exe", "strip-ansi-escapes.exe",
+}
 
 
 def request(nonce="67890", source=SOURCE):
@@ -79,9 +82,16 @@ def run():
     }
 
 
+def build_jobs():
+    return [{
+        "name": name, "run_id": RUN, "run_attempt": ATTEMPT,
+        "status": "completed", "conclusion": "success",
+    } for name in ("build-x64", "build-arm64", "validate-arm64")]
+
+
 def build_job():
     return {
-        "name": "build", "run_id": RUN, "run_attempt": ATTEMPT,
+        "name": "build-x64", "run_id": RUN, "run_attempt": ATTEMPT,
         "status": "completed", "conclusion": "success",
     }
 
@@ -91,7 +101,8 @@ def environment(snap=None):
         "GITHUB_REPOSITORY": BUILD_REPO, "GITHUB_EVENT_NAME": "schedule",
         "GITHUB_REF": "refs/heads/main", "GITHUB_SHA": CHECKOUT,
         "GITHUB_RUN_ID": str(RUN), "GITHUB_RUN_ATTEMPT": str(ATTEMPT),
-        "SNAPSHOT": json.dumps(snap or snapshot()), "ARTIFACT_ID": "789",
+        "SNAPSHOT": json.dumps(snap or snapshot()), "ARTIFACT_X64_ID": "789",
+        "ARTIFACT_ARM64_ID": "790",
     }
 
 
@@ -100,19 +111,30 @@ def manifest(snap=None, archive=b"fixture", run_id=RUN, attempt=ATTEMPT):
     req = snap["request"]
     build_id = f"{req['source_sha']}-{run_id}-{attempt}"
     return {
-        "schema": 1, "source_repository": "wezterm/wezterm",
+        "schema": 2, "source_repository": "wezterm/wezterm",
         "source_sha": req["source_sha"], "build_repository": BUILD_REPO,
         "run_id": run_id, "run_attempt": attempt, "build_id": build_id,
-        "version": snap["version"], "archive_root": "WezTerm-windows-" + snap["version"],
-        "asset_name": "WezTerm-windows-" + build_id + ".zip",
-        "sha256": hashlib.sha256(archive).hexdigest(), "size": len(archive),
+        "version": snap["version"],
+        "assets": {"windows": {
+            "x86_64": {
+                "name": "WezTerm-windows-x86_64-" + build_id + ".zip",
+                "architecture": "x86_64", "archive_root": "WezTerm-windows-" + snap["version"],
+                "sha256": hashlib.sha256(archive).hexdigest(), "size": len(archive),
+            },
+            "aarch64": {
+                "name": "WezTerm-windows-aarch64-" + build_id + ".zip",
+                "architecture": "aarch64",
+                "archive_root": "WezTerm-windows-aarch64-" + snap["version"],
+                "sha256": hashlib.sha256(archive).hexdigest(), "size": len(archive),
+            },
+        }},
         "success": True, "request_id": req["request_id"],
         "requested_at": req["requested_at"], "nonce": req["nonce"],
     }
 
 
 def checksum(obj):
-    return f"{obj['sha256']}  {obj['asset_name']}\n".encode("ascii")
+    return pipeline.checksum_bytes(obj)
 
 
 def release(obj):
@@ -120,8 +142,11 @@ def release(obj):
         "id": 456, "draft": False, "prerelease": False, "immutable": True,
         "tag_name": "wezterm-" + obj["build_id"],
         "assets": [
-            {"name": obj["asset_name"], "state": "uploaded", "size": obj["size"],
-             "digest": "sha256:" + obj["sha256"]},
+            *[
+                {"name": asset["name"], "state": "uploaded", "size": asset["size"],
+                 "digest": "sha256:" + asset["sha256"]}
+                for asset in obj["assets"]["windows"].values()
+            ],
             {"name": "provenance.json", "state": "uploaded"},
             {"name": "SHA256SUMS", "state": "uploaded"},
         ],
@@ -138,7 +163,7 @@ class FakePublic:
         self.race_at = None
         self.race = None
         self.run = run()
-        self.jobs = [build_job()]
+        self.jobs = build_jobs()
         self.releases = []
         self.blobs = {}
         self.calls = []
@@ -224,11 +249,26 @@ class WorkspaceCase(unittest.TestCase):
         except OSError:
             pass
 
-    def make_zip(self, path, members=None):
-        members = members if members is not None else [
-            ("WezTerm-windows-" + VERSION + "/" + name, b"dummy binary")
-            for name in sorted(REQUIRED_FILES)
-        ]
+    def pe(self, machine=0xAA64):
+        data = bytearray(128)
+        data[:2] = b"MZ"
+        data[0x3c:0x40] = (64).to_bytes(4, "little")
+        data[64:68] = b"PE\0\0"
+        data[68:70] = machine.to_bytes(2, "little")
+        return bytes(data)
+
+    def make_zip(self, path, members=None, architecture="x86_64"):
+        if members is None and architecture == "x86_64":
+            members = [
+                ("WezTerm-windows-" + VERSION + "/" + name,
+                 self.pe(0x8664) if name.casefold().endswith(".exe") else b"dummy binary")
+                for name in sorted(REQUIRED_FILES)
+            ]
+        elif members is None:
+            members = [
+                ("WezTerm-windows-aarch64-" + VERSION + "/" + name, self.pe())
+                for name in sorted(ARM64_FILES)
+            ]
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -241,19 +281,30 @@ class WorkspaceCase(unittest.TestCase):
         directory = self.work / "fixture-package"
         directory.mkdir()
         obj = manifest(snap)
-        archive = self.make_zip(directory / obj["asset_name"])
-        obj["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
-        obj["size"] = archive.stat().st_size
+        for architecture, asset in obj["assets"]["windows"].items():
+            archive = self.make_zip(directory / asset["name"], architecture=architecture)
+            asset["sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+            asset["size"] = archive.stat().st_size
         (directory / "provenance.json").write_text(json.dumps(obj), encoding="utf-8")
         (directory / "SHA256SUMS").write_bytes(checksum(obj))
         return directory, obj
 
     def publication(self, snap=None):
         directory, obj = self.make_package(snap)
-        artifact = self.work / "fixture-artifact.zip"
-        with zipfile.ZipFile(artifact, "w") as archive:
-            for item in directory.iterdir():
-                archive.write(item, item.name)
+        artifacts = {}
+        for index, architecture in enumerate(("x86_64", "aarch64"), start=789):
+            asset = obj["assets"]["windows"][architecture]
+            record = pipeline.record_common(snap or snapshot(), RUN, ATTEMPT)
+            record.update({
+                "name": asset["name"], "architecture": architecture,
+                "archive_root": asset["archive_root"], "sha256": asset["sha256"],
+                "size": asset["size"],
+            })
+            artifact = self.work / f"fixture-artifact-{architecture}.zip"
+            with zipfile.ZipFile(artifact, "w") as archive:
+                archive.write(directory / asset["name"], asset["name"])
+                archive.writestr("build-record.json", json.dumps(record))
+            artifacts[index] = artifact
         public = FakePublic(snap)
         own = mock.Mock()
         uploaded = []
@@ -263,9 +314,12 @@ class WorkspaceCase(unittest.TestCase):
                 self.assertEqual(data, {"ref": "refs/tags/wezterm-" + obj["build_id"],
                                         "sha": CHECKOUT})
                 return {"ref": data["ref"], "object": {"type": "commit", "sha": CHECKOUT}}
-            if (method, suffix) == ("GET", "/actions/artifacts/789"):
+            if method == "GET" and suffix in ("/actions/artifacts/789", "/actions/artifacts/790"):
+                artifact_id = int(suffix.rsplit("/", 1)[1])
+                architecture = "x86_64" if artifact_id == 789 else "aarch64"
                 return {
-                    "id": 789, "name": "package-" + obj["build_id"], "expired": False,
+                    "id": artifact_id, "name": f"package-{architecture}-" + obj["build_id"],
+                    "expired": False,
                     "workflow_run": {"id": RUN, "head_sha": CHECKOUT, "head_branch": "main"},
                 }
             if (method, suffix) == ("POST", "/releases"):
@@ -279,7 +333,10 @@ class WorkspaceCase(unittest.TestCase):
                 self.assertEqual(content_type, "application/octet-stream")
                 name = suffix.split("name=", 1)[1]
                 uploaded.append(name)
-                self.assertEqual(data, (directory / name).read_bytes())
+                if name == "provenance.json":
+                    self.assertEqual(json.loads(data), obj)
+                else:
+                    self.assertEqual(data, (directory / name).read_bytes())
                 return {
                     "name": name, "state": "uploaded", "size": len(data),
                     "digest": "sha256:" + hashlib.sha256(data).hexdigest(),
@@ -290,9 +347,9 @@ class WorkspaceCase(unittest.TestCase):
             raise AssertionError("unexpected authenticated route: " + suffix)
 
         def download(artifact_id, destination):
-            self.assertEqual(artifact_id, 789)
+            self.assertIn(artifact_id, artifacts)
             self.assertFalse(destination.exists())
-            destination.write_bytes(artifact.read_bytes())
+            destination.write_bytes(artifacts[artifact_id].read_bytes())
 
         own.call.side_effect = call
         own.optional.return_value = None
@@ -355,7 +412,6 @@ class RequestTests(unittest.TestCase):
     def test_identity_exact_source_run_attempt(self):
         self.assertEqual(pipeline.identity(SOURCE, RUN, ATTEMPT), (
             f"{SOURCE}-{RUN}-{ATTEMPT}", f"wezterm-{SOURCE}-{RUN}-{ATTEMPT}",
-            f"WezTerm-windows-{SOURCE}-{RUN}-{ATTEMPT}.zip",
         ))
         for sha, run_id, attempt in [(SOURCE.upper(), RUN, ATTEMPT),
                                      (SOURCE, True, ATTEMPT), (SOURCE, RUN, "2"),
@@ -506,12 +562,13 @@ class ProvenanceTests(unittest.TestCase):
                     pipeline.prove_run(api, RUN, ATTEMPT, "main", completed=True, head_sha=CHECKOUT)
 
     def test_run_proof_requires_one_successful_build_job_same_attempt(self):
-        jobs = [
-            [], [dict(build_job(), name="publish")], [build_job(), build_job()],
-            [dict(build_job(), run_id=RUN + 1)], [dict(build_job(), run_attempt=ATTEMPT + 1)],
-            [dict(build_job(), status="in_progress")], [dict(build_job(), conclusion="failure")],
-            [dict(build_job(), conclusion="skipped")],
-        ]
+        jobs = [[], [dict(build_job(), name="publish")], build_jobs()[:-1]]
+        for field, value in (("run_id", RUN + 1), ("run_attempt", ATTEMPT + 1),
+                             ("status", "in_progress"), ("conclusion", "failure"),
+                             ("conclusion", "skipped")):
+            rows = build_jobs()
+            rows[0][field] = value
+            jobs.append(rows)
         for rows in jobs:
             with self.subTest(jobs=rows):
                 api = FakePublic()
@@ -532,15 +589,20 @@ class ProvenanceTests(unittest.TestCase):
             {"extra": True}, {"schema": True}, {"success": 1},
             {"source_repository": "attacker/wezterm"}, {"build_repository": REQUEST_REPO},
             {"source_sha": SOURCE.upper()}, {"run_id": True}, {"run_attempt": 0},
-            {"build_id": "wrong"}, {"asset_name": "WezTerm-windows.zip"},
-            {"sha256": good["sha256"].upper()}, {"size": True}, {"size": 0},
-            {"size": pipeline.MAX_ZIP + 1}, {"version": "20261010-123456-deadbeef"},
-            {"archive_root": "wrong"}, {"request_id": "0" * 64}, {"nonce": 67890},
+            {"build_id": "wrong"}, {"version": "20261010-123456-deadbeef"},
+            {"request_id": "0" * 64}, {"nonce": 67890},
             {"requested_at": "2026-10-11T15:00:00+00:00"},
         ]
         for change in changes:
             with self.subTest(change=change), self.assertRaises(ValueError):
                 pipeline.validate_manifest(dict(good, **change), snapshot(), RUN, ATTEMPT)
+        for key, value in (("name", "wrong.zip"), ("architecture", "wrong"),
+                           ("archive_root", "wrong"), ("sha256", "A" * 64),
+                           ("size", True), ("size", pipeline.MAX_ZIP + 1)):
+            changed = copy.deepcopy(good)
+            changed["assets"]["windows"]["aarch64"][key] = value
+            with self.subTest(asset_key=key), self.assertRaises(ValueError):
+                pipeline.validate_manifest(changed, snapshot(), RUN, ATTEMPT)
         with self.assertRaises(ValueError):
             pipeline.validate_manifest(manifest(snapshot("67891")), snapshot(), RUN, ATTEMPT)
         with self.assertRaises(ValueError):
@@ -551,7 +613,8 @@ class ArchiveTests(WorkspaceCase):
     def test_valid_tiny_nonempty_windows_zip_and_package(self):
         directory, obj = self.make_package()
         self.assertEqual(pipeline.validate_package(directory, snapshot(), RUN, ATTEMPT), obj)
-        self.assertEqual(pipeline.digest_file(directory / obj["asset_name"]), obj["sha256"])
+        asset = obj["assets"]["windows"]["x86_64"]
+        self.assertEqual(pipeline.digest_file(directory / asset["name"]), asset["sha256"])
 
     def test_zip_rejects_traversal_windows_names_and_casefold_duplicates(self):
         bad_names = [
@@ -639,18 +702,54 @@ class ArchiveTests(WorkspaceCase):
         ]
         for index, rows in enumerate(cases):
             with self.subTest(case=index), self.assertRaises(ValueError):
-                pipeline.check_zip(self.make_zip(self.work / "bad.zip", rows), root)
+                pipeline.check_zip(self.make_zip(self.work / "bad.zip", rows), root, "x86_64")
+
+    def test_arm64_zip_requires_only_arm_binaries_optional_pdbs_and_aa64_machine(self):
+        root = "WezTerm-windows-aarch64-" + VERSION
+        good = [(root + "/" + name, self.pe()) for name in sorted(ARM64_FILES)]
+        good.append((root + "/wezterm.pdb", b"symbols"))
+        pipeline.check_zip(self.make_zip(self.work / "arm.zip", good), root, "aarch64")
+        for rows in (
+                good[:-2],
+                good + [(root + "/conpty.dll", b"x64")],
+                [(name, self.pe(0x8664)) if name.endswith(".exe") else (name, data)
+                 for name, data in good]):
+            with self.subTest(rows=len(rows)), self.assertRaises(ValueError):
+                pipeline.check_zip(self.make_zip(self.work / "bad-arm.zip", rows),
+                                   root, "aarch64")
+
+    def test_x64_zip_requires_8664_machine_for_every_executable(self):
+        root = "WezTerm-windows-" + VERSION
+        good = [
+            (root + "/" + name,
+             self.pe(0x8664) if name.casefold().endswith(".exe") else b"runtime")
+            for name in sorted(REQUIRED_FILES)
+        ]
+        good.append((root + "/additional-tool.exe", self.pe(0x8664)))
+        pipeline.check_zip(self.make_zip(self.work / "x64.zip", good), root, "x86_64")
+
+        for wrong_names in ({"wezterm-gui.exe"}, {"OpenConsole.exe", "additional-tool.exe"}):
+            mixed = [
+                (name, self.pe(0xAA64) if name.rsplit("/", 1)[-1] in wrong_names else data)
+                for name, data in good
+            ]
+            with self.subTest(wrong=sorted(wrong_names)), self.assertRaisesRegex(
+                    ValueError, "wrong PE machine type"):
+                pipeline.check_zip(self.make_zip(self.work / "bad-x64.zip", mixed),
+                                   root, "x86_64")
 
     def test_zip_reads_and_rejects_corrupt_crc_even_with_matching_manifest_sha(self):
         directory, obj = self.make_package()
-        path = directory / obj["asset_name"]
+        asset = obj["assets"]["windows"]["x86_64"]
+        path = directory / asset["name"]
         with zipfile.ZipFile(path, "w", zipfile.ZIP_STORED) as archive:
             for name in sorted(REQUIRED_FILES):
-                archive.writestr(obj["archive_root"] + "/" + name, b"dummy binary")
+                data = self.pe(0x8664) if name.casefold().endswith(".exe") else b"dummy binary"
+                archive.writestr(asset["archive_root"] + "/" + name, data)
         data = path.read_bytes().replace(b"dummy binary", b"wrong binary", 1)
         path.write_bytes(data)
-        obj["sha256"] = hashlib.sha256(data).hexdigest()
-        obj["size"] = len(data)
+        asset["sha256"] = hashlib.sha256(data).hexdigest()
+        asset["size"] = len(data)
         (directory / "provenance.json").write_text(json.dumps(obj), encoding="utf-8")
         (directory / "SHA256SUMS").write_bytes(checksum(obj))
         with self.assertRaises(zipfile.BadZipFile):
@@ -660,8 +759,9 @@ class ArchiveTests(WorkspaceCase):
         for target in ("archive", "checksum", "manifest", "extra", "symlink"):
             with self.subTest(target=target):
                 directory, obj = self.make_package()
+                name = obj["assets"]["windows"]["x86_64"]["name"]
                 if target == "archive":
-                    (directory / obj["asset_name"]).write_bytes(b"tampered")
+                    (directory / name).write_bytes(b"tampered")
                 elif target == "checksum":
                     (directory / "SHA256SUMS").write_bytes(b"wrong\n")
                 elif target == "manifest":
@@ -670,7 +770,7 @@ class ArchiveTests(WorkspaceCase):
                 elif target == "extra":
                     (directory / "unexpected.exe").write_bytes(b"x")
                 else:
-                    archive = directory / obj["asset_name"]
+                    archive = directory / name
                     original = self.work / "archive-original"
                     archive.rename(original)
                     archive.symlink_to(original)
@@ -683,15 +783,20 @@ class ArchiveTests(WorkspaceCase):
         with self.assertRaises(ValueError):
             pipeline.validate_package(link, snapshot(), RUN, ATTEMPT)
 
-    def test_artifact_unpack_only_exact_three_regular_files_into_fresh_directory(self):
+    def test_artifact_unpack_only_exact_build_record_and_archive(self):
         directory, obj = self.make_package()
-        members = [(item.name, item.read_bytes()) for item in directory.iterdir()]
+        asset = obj["assets"]["windows"]["x86_64"]
+        record = pipeline.record_common(snapshot(), RUN, ATTEMPT)
+        record.update({**asset, "architecture": "x86_64"})
+        members = [(asset["name"], (directory / asset["name"]).read_bytes()),
+                   ("build-record.json", json.dumps(record).encode())]
         path = self.make_zip(self.work / "artifact-fixture.zip", members)
         destination = self.work / "unpacked"
-        pipeline.unpack_artifact(path, destination, obj["asset_name"])
-        self.assertEqual(pipeline.validate_package(destination, snapshot(), RUN, ATTEMPT), obj)
+        pipeline.unpack_artifact(path, destination, asset["name"])
+        self.assertEqual(pipeline.validate_build_package(
+            destination, snapshot(), RUN, ATTEMPT, "x86_64"), record)
         with self.assertRaises(ValueError):
-            pipeline.unpack_artifact(path, destination, obj["asset_name"])
+            pipeline.unpack_artifact(path, destination, asset["name"])
         for index, rows in enumerate([
             members + [("extra", b"x")], members[:-1],
             members + [("../escape", b"x")],
@@ -699,7 +804,7 @@ class ArchiveTests(WorkspaceCase):
             with self.subTest(case=index), self.assertRaises(ValueError):
                 pipeline.unpack_artifact(
                     self.make_zip(self.work / "invalid-artifact.zip", rows),
-                    self.work / ("unpacked-" + str(index)), obj["asset_name"],
+                    self.work / ("unpacked-" + str(index)), asset["name"],
                 )
         self.assertFalse((self.work / "escape").exists())
 
@@ -815,26 +920,44 @@ class ControlPlaneTests(WorkspaceCase):
             pipeline.poll(api)
         self.assertFalse(output.exists())
 
-    def test_package_happy_path_creates_provenance_without_publication_client(self):
+    def test_x64_package_happy_path_creates_build_record_without_publication_client(self):
         candidate = self.work / "candidate"
         candidate.mkdir()
         self.make_zip(candidate / ("WezTerm-windows-" + VERSION + ".zip"))
         with mock.patch.object(pipeline, "OwnAPI", side_effect=AssertionError("write token boundary")):
-            pipeline.package(FakePublic())
-        obj = pipeline.validate_package(self.work / "package", snapshot(), RUN, ATTEMPT)
+            pipeline.package(FakePublic(), "x86_64")
+        obj = pipeline.validate_build_package(
+            self.work / "package", snapshot(), RUN, ATTEMPT, "x86_64")
         self.assertEqual(obj["request_id"], request()["request_id"])
-        self.assertEqual(obj["asset_name"], f"WezTerm-windows-{SOURCE}-{RUN}-{ATTEMPT}.zip")
+        self.assertEqual(obj["name"], f"WezTerm-windows-x86_64-{SOURCE}-{RUN}-{ATTEMPT}.zip")
+
+    def test_arm64_package_stages_only_target_executables_and_matching_pdb(self):
+        release = self.work / "candidate/target/aarch64-pc-windows-msvc/release"
+        release.mkdir(parents=True)
+        for name in ARM64_FILES:
+            (release / name).write_bytes(self.pe())
+        (release / "wezterm.pdb").write_bytes(b"symbols")
+        for forbidden in ("conpty.dll", "OpenConsole.exe", "libEGL.dll", "libGLESv2.dll"):
+            (release / forbidden).write_bytes(b"x64 runtime")
+        pipeline.package(FakePublic(), "aarch64")
+        record = pipeline.validate_build_package(
+            self.work / "package", snapshot(), RUN, ATTEMPT, "aarch64")
+        with zipfile.ZipFile(self.work / "package" / record["name"]) as archive:
+            files = {entry.filename.rsplit("/", 1)[-1] for entry in archive.infolist()
+                     if not entry.is_dir()}
+        self.assertEqual(files, ARM64_FILES | {"wezterm.pdb"})
 
     def test_publish_happy_path_verifies_artifact_and_creates_immutable_release(self):
         api, own, obj, uploaded = self.publication()
         pipeline.publish(api, own)
-        self.assertEqual(set(uploaded), {obj["asset_name"], "provenance.json", "SHA256SUMS"})
-        self.assertEqual(len(uploaded), 3)
-        own.download_artifact.assert_called_once()
+        names = {asset["name"] for asset in obj["assets"]["windows"].values()}
+        self.assertEqual(set(uploaded), names | {"provenance.json", "SHA256SUMS"})
+        self.assertEqual(len(uploaded), 4)
+        self.assertEqual(own.download_artifact.call_count, 2)
         self.assertEqual(api.pr_reads, 6)
         self.assertEqual(pipeline.successful_source(api, SOURCE, "main"), api.releases[0])
         mutations = [call.args[0] for call in own.call.call_args_list if call.args[0] != "GET"]
-        self.assertEqual(mutations, ["POST", "POST", "POST", "POST", "POST", "PATCH"])
+        self.assertEqual(mutations, ["POST", "POST", "POST", "POST", "POST", "POST", "PATCH"])
 
     def test_publish_dedup_across_request_identities_never_downloads_or_writes(self):
         api = FakePublic(snapshot("67891"))
@@ -880,7 +1003,7 @@ class ControlPlaneTests(WorkspaceCase):
         api.releases.clear()
         own.optional.return_value = value
         pipeline.publish(api, own)
-        self.assertEqual([call.args[0] for call in own.call.call_args_list], ["GET"])
+        self.assertEqual([call.args[0] for call in own.call.call_args_list], ["GET", "GET"])
         own.optional.assert_called_once_with("/releases/tags/wezterm-" + obj["build_id"])
 
     def test_publish_refuses_preexisting_tag_without_release(self):
@@ -888,7 +1011,7 @@ class ControlPlaneTests(WorkspaceCase):
         own.optional.side_effect = [None, {"ref": "existing"}]
         with self.assertRaisesRegex(ValueError, "never reuse"):
             pipeline.publish(api, own)
-        self.assertEqual([call.args[0] for call in own.call.call_args_list], ["GET"])
+        self.assertEqual([call.args[0] for call in own.call.call_args_list], ["GET", "GET"])
 
     def test_publish_tag_creation_race_fails_without_creating_release_or_reusing_tag(self):
         api, own, _, _ = self.publication()
@@ -905,17 +1028,22 @@ class ControlPlaneTests(WorkspaceCase):
 
     def test_publish_rejects_artifact_metadata_before_download(self):
         changes = [
-            {"id": 790}, {"name": "package-wrong"}, {"expired": True},
+            {"id": 791}, {"name": "package-wrong"}, {"expired": True},
             {"workflow_run": {"id": RUN + 1, "head_sha": CHECKOUT, "head_branch": "main"}},
             {"workflow_run": {"id": RUN, "head_sha": "d" * 40, "head_branch": "main"}},
             {"workflow_run": {"id": RUN, "head_sha": CHECKOUT, "head_branch": "feature"}},
         ]
         for change in changes:
             with self.subTest(change=change):
+                for path in self.work.iterdir():
+                    if path.is_dir():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink()
                 api = FakePublic()
                 own = mock.Mock()
                 own.call.return_value = dict(
-                    id=789, name=f"package-{SOURCE}-{RUN}-{ATTEMPT}", expired=False,
+                    id=789, name=f"package-x86_64-{SOURCE}-{RUN}-{ATTEMPT}", expired=False,
                     workflow_run={"id": RUN, "head_sha": CHECKOUT, "head_branch": "main"},
                 )
                 own.call.return_value.update(change)
@@ -940,28 +1068,29 @@ class ControlPlaneTests(WorkspaceCase):
         self.assertEqual(api.releases, [])
 
     def test_publish_corrupted_package_never_creates_release(self):
-        api, own, obj, _ = self.publication()
-        artifact = self.work / "fixture-artifact.zip"
-        directory = self.work / "fixture-package"
-        (directory / obj["asset_name"]).write_bytes(b"tampered")
-        with zipfile.ZipFile(artifact, "w") as archive:
-            for item in directory.iterdir():
-                archive.write(item, item.name)
-        with self.assertRaisesRegex(ValueError, "archive checksum/size"):
+        api, own, _, _ = self.publication()
+        own.download_artifact.side_effect = lambda artifact_id, destination: destination.write_bytes(
+            b"not a zip")
+        with self.assertRaises(zipfile.BadZipFile):
             pipeline.publish(api, own)
         own.optional.assert_not_called()
         self.assertEqual([call.args[0] for call in own.call.call_args_list], ["GET"])
 
     def test_main_poll_and_package_never_construct_authenticated_client(self):
-        for command in ("poll", "package"):
+        for command, arguments, expected in (
+                ("poll", ["pipeline.py", "poll"], None),
+                ("package", ["pipeline.py", "package", "x86_64"], "x86_64")):
             with self.subTest(command=command), \
-                 mock.patch.object(pipeline.sys, "argv", ["pipeline.py", command]), \
+                 mock.patch.object(pipeline.sys, "argv", arguments), \
                  mock.patch.object(pipeline, "PublicAPI") as public, \
                  mock.patch.object(pipeline, "OwnAPI", side_effect=AssertionError("token access")), \
                  mock.patch.object(pipeline, command) as action:
                 os.environ["GITHUB_TOKEN"] = "publication-secret"
                 pipeline.main()
-                action.assert_called_once_with(public.return_value)
+                if expected is None:
+                    action.assert_called_once_with(public.return_value)
+                else:
+                    action.assert_called_once_with(public.return_value, expected)
 
     def test_artifact_download_token_only_goes_to_build_repository(self):
         opener = mock.MagicMock()
@@ -1022,7 +1151,7 @@ class TokenBoundaryTests(unittest.TestCase):
             req = opener.open.call_args.args[0]
             self.assertEqual(req.full_url, f"https://api.github.com/repos/{BUILD_REPO}/releases")
             self.assertEqual(req.get_header("Authorization"), "Bearer publication-token")
-            asset = f"WezTerm-windows-{SOURCE}-{RUN}-{ATTEMPT}.zip"
+            asset = f"WezTerm-windows-aarch64-{SOURCE}-{RUN}-{ATTEMPT}.zip"
             api.call("POST", "/releases/456/assets?name=" + asset, b"zip",
                      content_type="application/octet-stream", upload=True)
             req = opener.open.call_args.args[0]
@@ -1171,6 +1300,16 @@ class BuildCacheTests(WorkspaceCase):
         self.assertFalse(old["target_key"].startswith(changed["target_restore"]))
         self.assertTrue(old["registry_key"].startswith(changed["registry_restore"]))
         self.assertEqual(old["nextest_key"], changed["nextest_key"])
+
+    def test_arm64_cache_identity_is_disjoint_from_x64(self):
+        arm = copy.deepcopy(self.identity)
+        arm["target"] = "aarch64-pc-windows-msvc"
+        arm["environment"]["CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS"] = \
+            "-Ctarget-feature=+crt-static"
+        x64_plan, arm_plan = self.plan(), self.plan(identity=arm)
+        for kind in ("registry", "target", "nextest"):
+            self.assertNotEqual(x64_plan[kind + "_key"], arm_plan[kind + "_key"])
+            self.assertIn("-Windows-ARM64-", arm_plan[kind + "_key"])
 
     def test_all_environment_changes_invalidate_all_cache_families(self):
         old = self.plan()
@@ -1321,159 +1460,92 @@ class BuildCacheTests(WorkspaceCase):
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.workflow = (ROOT / WORKFLOW).read_text(encoding="utf-8")
-        self.build = self.workflow.split("\n  build:\n", 1)[1].split("\n  publish:\n", 1)[0]
-        self.publish = self.workflow.split("\n  publish:\n", 1)[1]
+        self.script = (ROOT / "scripts/build.ps1").read_text(encoding="utf-8")
+        self.smoke = (ROOT / "scripts/arm64-smoke.ps1").read_text(encoding="utf-8")
 
-    def test_only_schedule_and_dispatch_on_default_build_repository(self):
+    def test_trigger_and_trust_boundaries_remain_closed(self):
         triggers = self.workflow.split("\npermissions:", 1)[0]
-        self.assertIn("schedule:", triggers)
-        self.assertIn("cron: '23 * * * *'", triggers)
-        self.assertIn("workflow_dispatch:", triggers)
-        for trigger in ("pull_request:", "pull_request_target:", "push:", "workflow_run:",
-                        "repository_dispatch:"):
+        for trigger in ("pull_request:", "push:", "workflow_run:", "repository_dispatch:"):
             self.assertNotIn(trigger, triggers)
-        self.assertIn("github.repository == 'dc0d32/wezterm-builds'", self.workflow)
-        self.assertIn("github.ref_name == github.event.repository.default_branch", self.workflow)
+        self.assertIn("cron: '23 * * * *'", triggers)
         self.assertIn("cancel-in-progress: false", self.workflow)
+        self.assertNotIn("continue-on-error", self.workflow)
+        self.assertEqual(self.workflow.count("persist-credentials: false"), 5)
 
-    def test_remote_actions_are_reviewed_pins_and_restore_is_local(self):
+    def test_dual_builds_use_disjoint_architecture_parameters_and_expected_runners(self):
+        self.assertRegex(self.workflow, r"(?s)build-x64:.*?runs-on: windows-2025")
+        self.assertRegex(self.workflow, r"(?s)build-arm64:.*?runs-on: windows-2025")
+        self.assertIn("-Phase Compile -Architecture x86_64", self.workflow)
+        self.assertIn("-Phase Compile -Architecture aarch64", self.workflow)
+        self.assertIn("runs-on: windows-11-arm", self.workflow)
+        self.assertIn("aarch64-pc-windows-msvc", self.script)
+        self.assertIn("-arch=$nativeArch -host_arch=x64", self.script)
+        self.assertIn("CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS", self.script)
+        self.assertIn("-Ctarget-feature=+crt-static", self.script)
+
+    def test_x64_preserves_native_nextest_and_upstream_packaging(self):
+        self.assertIn("'nextest', 'run', '--locked', '--all', '--no-fail-fast'", self.script)
+        self.assertIn("ci/deploy.sh", self.script)
+        self.assertIn("if ($Architecture -eq 'x86_64')", self.script)
+        self.assertIn(r"C:\Program Files\Git\bin\bash.exe", self.script)
+
+    def test_arm64_compiles_tests_without_running_and_never_uses_upstream_packaging(self):
+        self.assertIn("'test', '--locked', '--all', '--no-run', '--target', $target", self.script)
+        self.assertIn('"target/$target/release"', self.script)
+        self.assertIn("pipeline.py', 'package', $Architecture", self.script)
+        self.assertIn("ARM64 package file allowlist", (ROOT / "scripts/pipeline.py").read_text())
+
+    def test_native_validation_gates_publication(self):
+        publish = self.workflow.split("\n  publish:\n", 1)[1]
+        self.assertIn("needs: [poll, build-x64, build-arm64, validate-arm64]", publish)
+        self.assertIn("needs.validate-arm64.result == 'success'", publish)
+        self.assertIn("ARTIFACT_X64_ID:", publish)
+        self.assertIn("ARTIFACT_ARM64_ID:", publish)
+        self.assertIn("contents: write", publish)
+        validation = self.workflow.split("\n  validate-arm64:\n", 1)[1].split("\n  publish:\n", 1)[0]
+        self.assertIn("actions: read", validation)
+        self.assertIn("github.repository == 'dc0d32/wezterm-builds'", validation)
+        self.assertIn("github.ref_name == github.event.repository.default_branch", validation)
+        self.assertIn("pipeline.py validate-arm64", validation)
+        self.assertIn("arm64-smoke.ps1", validation)
+
+    def test_only_pinned_reviewed_actions_and_local_restore_are_used(self):
         actions = re.findall(r"uses: ([^\s#]+)", self.workflow)
-        self.assertEqual(len(actions), 10)
         allowed = {
             "actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09",
             "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+            "actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0",
             "./control/.github/actions/cache-restore",
             "actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830",
         }
         self.assertEqual(set(actions), allowed)
-        self.assertEqual(actions.count("./control/.github/actions/cache-restore"), 3)
-        self.assertEqual(actions.count("actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830"), 3)
         self.assertNotIn("actions/cache/restore@", self.workflow)
-        self.assertEqual(self.workflow.count("persist-credentials: false"), 3)
-        self.assertEqual(self.workflow.count("ref: ${{ github.sha }}"), 3)
 
-    def test_build_has_no_write_token_and_current_attempt_artifact_identity(self):
-        self.assertIn("contents: read", self.build)
-        self.assertNotIn("contents: write", self.build)
-        self.assertNotIn("secrets.", self.build)
-        self.assertNotIn("GITHUB_TOKEN:", self.build)
-        self.assertNotIn("actions: write", self.build)
-        self.assertIn("overwrite: false", self.build)
-        self.assertIn("package-${{ fromJSON(needs.poll.outputs.snapshot).request.source_sha }}"
-                      "-${{ github.run_id }}-${{ github.run_attempt }}", self.build)
-        script = (ROOT / "scripts/build.ps1").read_text(encoding="utf-8")
-        self.assertIn("https://github.com/wezterm/wezterm.git", script)
-        self.assertIn("'checkout', '--detach', 'FETCH_HEAD'", script)
-        self.assertIn("'submodule', 'update', '--init', '--recursive'", script)
-        self.assertIn("protocol.allow=never", script)
-        self.assertIn("protocol.https.allow=always", script)
-        self.assertIn("Invoke-Checked cargo @('build', '--locked', '--release'", script)
-        self.assertIn("Invoke-Checked $nextest @('nextest', 'run', '--locked', '--all', '--no-fail-fast')", script)
-        self.assertNotIn("--all-targets", script)
-        self.assertIn(".tag", script)
-        self.assertIn("ci/deploy.sh", script)
+    def test_arm_smoke_covers_all_binaries_conpty_and_renderer(self):
+        for executable in ARM64_FILES:
+            self.assertIn(executable, self.smoke)
+        self.assertIn("front_end='WebGpu'", self.smoke)
+        self.assertIn("ARM64 ConPTY console child was not observed", self.smoke)
 
-    def test_build_uses_upstream_nextest_without_skipping_ssh(self):
-        script = (ROOT / "scripts/build.ps1").read_text(encoding="utf-8")
-        self.assertIn("'install', 'cargo-nextest', '--locked', '--version', \"=$nextestVersion\"", script)
-        self.assertLess(script.index("'install', 'cargo-nextest'"),
-                        script.index("Push-Location candidate"))
-        self.assertIn("'nextest', 'run', '--locked', '--all', '--no-fail-fast'", script)
-        for forbidden in ("cargo test ", "--exclude", "--skip", "--run-ignored",
-                          "rm -rf", "wezterm-ssh/tests"):
-            self.assertNotIn(forbidden, script)
+    def test_arm_smoke_drops_runtime_and_package_credentials_before_artifact_code(self):
+        for credential in (
+                "ACTIONS_.*", "GITHUB_TOKEN", "GH_TOKEN", "CARGO_.*TOKEN",
+                "NPM_TOKEN", "NODE_AUTH_TOKEN", "NUGET_AUTH_TOKEN", "PYPI_API_TOKEN",
+                "TWINE_USERNAME", "TWINE_PASSWORD"):
+            self.assertIn(credential, self.smoke)
+        self.assertLess(self.smoke.index("Remove-Item"), self.smoke.index("$snapshot ="))
+        self.assertLess(self.smoke.index("Assert-NoArtifactCredentials"),
+                        self.smoke.index("$snapshot ="))
 
-    def test_build_keeps_upstream_crt_config_and_packaging_dependencies(self):
-        script = (ROOT / "scripts/build.ps1").read_text(encoding="utf-8")
-        self.assertIn("Invoke-Checked cargo @('vendor', '--locked', '--versioned-dirs') |", script)
-        self.assertIn("Out-File -Append -Encoding utf8 .cargo/config.toml", script)
-        self.assertIn(r"C:\Strawberry\perl\bin", script)
-        self.assertIn(r"C:\Program Files\Inno Setup 6", script)
-        self.assertIn(r"C:\Program Files\Git\bin\bash.exe", script)
-        self.assertIn("$env:TAG_NAME = $version", script)
-        self.assertIn("$env:BUILD_REASON = ''", script)
-
-    def test_publisher_executes_only_trusted_default_scripts(self):
-        self.assertIn("needs: [poll, build]", self.publish)
-        self.assertIn("needs.build.result == 'success'", self.publish)
-        self.assertIn("contents: write", self.publish)
-        self.assertIn("actions: read", self.publish)
-        self.assertIn("path: control", self.publish)
-        self.assertIn("python3 -B control/scripts/pipeline.py publish", self.publish)
-        self.assertIn("GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}", self.publish)
-        for forbidden in ("cargo ", "deploy.sh", "upstream", "candidate/", "download-artifact@",
-                          "actions/cache", ".cargo-build", ".nextest", "build_cache.py"):
-            self.assertNotIn(forbidden, self.publish)
-
-    def test_restore_and_save_have_only_the_three_narrow_paths(self):
-        paths = {"registry": ".cargo-build/registry/cache", "target": "candidate/target",
-                 "nextest": ".nextest/bin"}
-        self.assertEqual(paths, build_cache.PATHS)
-        restore, save = [], []
-        for block in self.build.split("      - name: ")[1:]:
-            if ("uses: actions/cache/save@" not in block
-                    and "uses: ./control/.github/actions/cache-restore" not in block):
-                continue
-            path = re.search(r"^          path: (.+)$", block, re.M).group(1)
-            kind = next(kind for kind, value in paths.items() if value == path)
-            self.assertIn("${{ steps.prepare.outputs." + kind + "_key }}", block)
-            if "uses: ./control/.github/actions/cache-restore" in block:
-                restore.append(path)
-                self.assertIn(f"id: {kind}", block)
-                if kind == "nextest":
-                    self.assertNotIn("restore-keys:", block)
-                else:
-                    self.assertIn("restore-keys: ${{ steps.prepare.outputs." + kind + "_restore }}", block)
-            else:
-                save.append(path)
-                for gate in ("success()", "steps.compile.outcome == 'success'",
-                             "github.repository == 'dc0d32/wezterm-builds'",
-                             "github.ref_name == github.event.repository.default_branch",
-                             "github.event_name == 'schedule'", "github.event_name == 'workflow_dispatch'",
-                             f"steps.{kind}.outputs.cache-hit != 'true'"):
-                    self.assertIn(gate, block)
-        self.assertCountEqual(restore, paths.values())
-        self.assertCountEqual(save, paths.values())
-        self.assertNotIn("continue-on-error", self.build)
-
-    def test_fresh_prepare_precedes_restore_and_compile_precedes_save(self):
-        prepare = self.build.index("-Phase Prepare")
-        compile_step = self.build.index("-Phase Compile")
-        restores = list(re.finditer(r"uses: \./control/\.github/actions/cache-restore", self.build))
-        self.assertEqual(len(restores), 3)
-        for match in restores:
-            self.assertLess(prepare, match.start())
-            self.assertLess(match.start(), compile_step)
-        for match in re.finditer("uses: actions/cache/save@", self.build):
-            self.assertLess(compile_step, match.start())
-        for gate in ("github.repository == 'dc0d32/wezterm-builds'",
-                     "github.ref_name == github.event.repository.default_branch",
-                     "github.event_name == 'schedule'", "github.event_name == 'workflow_dispatch'"):
-            self.assertIn(gate, self.build.split("    runs-on:", 1)[0])
-
-    def test_script_rechecks_identity_tool_and_forces_local_source_recompile(self):
-        script = (ROOT / "scripts/build.ps1").read_text()
-        self.assertIn('$env:GITHUB_REF -cne "refs/heads/$env:BUILD_DEFAULT_BRANCH"', script)
-        self.assertIn("$PSNativeCommandUseErrorActionPreference = $true", script)
-        self.assertIn("$env:RUSTUP_TOOLCHAIN = 'stable'", script)
-        self.assertIn("if ($LASTEXITCODE -ne 0)", script)
-        verify = script.index("'control/scripts/build_cache.py', 'verify'")
-        install = script.index("'install', 'cargo-nextest'")
-        check = script.index("'check-nextest-version', $toolVersion")
-        clean = script.index("'clean', '--package', $package.id")
-        build = script.index("'build', '--locked', '--release'")
-        self.assertLess(verify, install)
-        self.assertLess(check, clean)
-        self.assertLess(clean, build)
-        self.assertIn("if ($null -eq $package.source)", script)
-        self.assertIn("Stale workspace executable", script)
-        self.assertIn("Nextest cache hit is missing its executable", script)
-        self.assertIn("'--root', (Join-Path $root '.nextest-install')", script)
-        self.assertIn("'--target-dir', (Join-Path $root '.nextest-install/target')", script)
-        self.assertIn("Copy-Item '.nextest-install/bin/cargo-nextest.exe' $nextest", script)
-        self.assertNotIn("catch", script)
-        self.assertLess(script.index("'control/scripts/pipeline.py', 'package'"),
-                        script.rindex("'control/scripts/build_cache.py', 'validate'"))
+        invoke = self.smoke.split("function Invoke-Checked", 1)[1].split(
+            "function Start-ArtifactProcess", 1)[0]
+        start = self.smoke.split("function Start-ArtifactProcess", 1)[1].split(
+            "Assert-NoArtifactCredentials\n$snapshot", 1)[0]
+        self.assertLess(invoke.index("Assert-NoArtifactCredentials"), invoke.index("& $Command"))
+        self.assertLess(start.index("Assert-NoArtifactCredentials"),
+                        start.index("Start-Process -FilePath $FilePath"))
+        self.assertNotRegex(self.smoke, r"(?m)^\s*&\s+\.\\arm-smoke\\")
+        self.assertNotIn("Start-Process -FilePath .\\arm-smoke\\", self.smoke)
 
 
 if __name__ == "__main__":

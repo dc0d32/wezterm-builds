@@ -29,16 +29,32 @@ REQUEST_KEYS = {
 }
 MANIFEST_KEYS = {
     "schema", "source_repository", "source_sha", "build_repository", "run_id",
-    "run_attempt", "build_id", "version", "archive_root", "asset_name",
-    "sha256", "size", "success", "request_id", "requested_at", "nonce",
+    "run_attempt", "build_id", "version", "assets", "success", "request_id",
+    "requested_at", "nonce",
 }
+ASSET_KEYS = {"name", "architecture", "archive_root", "sha256", "size"}
+RECORD_KEYS = MANIFEST_KEYS - {"assets"} | ASSET_KEYS
 MAX_ZIP = 1024 * 1024 * 1024
 MAX_EXPANDED = 2 * MAX_ZIP
 MAX_FILE = 512 * 1024 * 1024
-REQUIRED_FILES = {
+X64_REQUIRED_FILES = {
     "wezterm.exe", "wezterm-gui.exe", "wezterm-mux-server.exe",
     "strip-ansi-escapes.exe", "wezterm.pdb", "conpty.dll", "OpenConsole.exe",
     "libEGL.dll", "libGLESv2.dll", "mesa/opengl32.dll",
+}
+ARM64_EXECUTABLES = {
+    "wezterm.exe", "wezterm-gui.exe", "wezterm-mux-server.exe",
+    "strip-ansi-escapes.exe",
+}
+ARCHITECTURES = {
+    "x86_64": {
+        "target": "x86_64-pc-windows-msvc",
+        "machine": 0x8664,
+    },
+    "aarch64": {
+        "target": "aarch64-pc-windows-msvc",
+        "machine": 0xAA64,
+    },
 }
 
 
@@ -149,7 +165,7 @@ class OwnAPI:
 
     def call(self, method, suffix, data=None, content_type="application/json", upload=False):
         tag = r"wezterm-[0-9a-f]{40}-[1-9][0-9]*-[1-9][0-9]*"
-        asset = r"(?:WezTerm-windows-[0-9a-f]{40}-[1-9][0-9]*-[1-9][0-9]*\.zip|provenance\.json|SHA256SUMS)"
+        asset = r"(?:WezTerm-windows-(?:x86_64|aarch64)-[0-9a-f]{40}-[1-9][0-9]*-[1-9][0-9]*\.zip|provenance\.json|SHA256SUMS)"
         route = rf"/(?:actions/artifacts/[1-9][0-9]*|git/refs|git/ref/tags/{tag}|releases(?:/tags/{tag}|/[1-9][0-9]*(?:/assets\?name={asset})?)?)"
         require(isinstance(suffix, str) and re.fullmatch(route, suffix), "own API suffix")
         require(method in ("GET", "POST", "PATCH"), "own API method")
@@ -270,7 +286,14 @@ def identity(source_sha, run_id, run_attempt):
     require(hex_string(source_sha, 40) and positive_int(run_id)
             and positive_int(run_attempt), "build identity")
     build_id = f"{source_sha}-{run_id}-{run_attempt}"
-    return build_id, "wezterm-" + build_id, "WezTerm-windows-" + build_id + ".zip"
+    return build_id, "wezterm-" + build_id
+
+
+def asset_name(architecture, build_id):
+    require(architecture in ARCHITECTURES, "architecture")
+    require(isinstance(build_id, str) and re.fullmatch(
+        r"[0-9a-f]{40}-[1-9][0-9]*-[1-9][0-9]*", build_id), "asset build identity")
+    return f"WezTerm-windows-{architecture}-{build_id}.zip"
 
 
 def context(api, env=os.environ):
@@ -306,31 +329,45 @@ def prove_run(api, run_id, attempt, default, completed=False, head_sha=None):
             break
     else:
         raise ValueError("jobs pagination exceeded safe bound")
-    builds = [job for job in rows if job.get("name") == "build"]
-    require(len(builds) == 1 and builds[0].get("run_id") == run_id
-            and builds[0].get("run_attempt") == attempt
-            and builds[0].get("status") == "completed"
-            and builds[0].get("conclusion") == "success", "successful build job required")
+    required_jobs = {"build-x64", "build-arm64", "validate-arm64"}
+    selected = [job for job in rows if job.get("name") in required_jobs]
+    require({job.get("name") for job in selected} == required_jobs and len(selected) == 3,
+            "all architecture jobs required")
+    require(all(job.get("run_id") == run_id and job.get("run_attempt") == attempt
+                and job.get("status") == "completed" and job.get("conclusion") == "success"
+                for job in selected), "successful architecture jobs required")
     return run
 
 
 def validate_manifest(obj, snapshot=None, run_id=None, attempt=None):
     require(type(obj) is dict and set(obj) == MANIFEST_KEYS, "manifest keys")
-    require(type(obj["schema"]) is int and obj["schema"] == 1, "manifest schema")
+    require(type(obj["schema"]) is int and obj["schema"] == 2, "manifest schema")
     require(obj["success"] is True and obj["source_repository"] == SOURCE_REPO
             and obj["build_repository"] == BUILD_REPO, "manifest repositories/success")
-    build_id, _, asset = identity(obj["source_sha"], obj["run_id"], obj["run_attempt"])
-    require(obj["build_id"] == build_id and obj["asset_name"] == asset, "manifest identity")
-    require(hex_string(obj["sha256"], 64) and positive_int(obj["size"])
-            and obj["size"] <= MAX_ZIP, "manifest checksum/size")
+    build_id, _ = identity(obj["source_sha"], obj["run_id"], obj["run_attempt"])
+    require(obj["build_id"] == build_id, "manifest identity")
     request = {key: obj[key] for key in
-               ("schema", "source_repository", "source_sha", "request_id", "requested_at", "nonce")}
+               ("source_repository", "source_sha", "request_id", "requested_at", "nonce")}
+    request["schema"] = 1
     request.update(repository=REQUEST_REPO, branch=BRANCH)
     validate_request(request)
     require(isinstance(obj["version"], str) and re.fullmatch(
         r"\d{8}-\d{6}-[0-9a-f]{8}", obj["version"])
         and obj["version"].endswith(obj["source_sha"][:8]), "manifest version")
-    require(obj["archive_root"] == "WezTerm-windows-" + obj["version"], "archive root")
+    require(type(obj["assets"]) is dict and set(obj["assets"]) == {"windows"},
+            "manifest platform assets")
+    windows = obj["assets"]["windows"]
+    require(type(windows) is dict and set(windows) == set(ARCHITECTURES),
+            "manifest architectures")
+    for architecture, asset in windows.items():
+        require(type(asset) is dict and set(asset) == ASSET_KEYS, "asset keys")
+        require(asset["architecture"] == architecture, "asset architecture")
+        require(asset["name"] == asset_name(architecture, build_id), "asset name")
+        require(hex_string(asset["sha256"], 64) and positive_int(asset["size"])
+                and asset["size"] <= MAX_ZIP, "asset checksum/size")
+        expected_root = ("WezTerm-windows-" if architecture == "x86_64"
+                         else "WezTerm-windows-aarch64-") + obj["version"]
+        require(asset["archive_root"] == expected_root, "archive root")
     if snapshot is not None:
         validate_snapshot(snapshot)
         require(all(obj[key] == snapshot["request"][key] for key in
@@ -381,7 +418,20 @@ def zip_members(archive):
     return members
 
 
-def check_zip(path, root):
+def pe_machine(stream):
+    stream.seek(0)
+    header = stream.read(64)
+    require(len(header) == 64 and header[:2] == b"MZ", "invalid PE DOS header")
+    offset = int.from_bytes(header[0x3c:0x40], "little")
+    require(64 <= offset <= MAX_FILE - 6, "invalid PE header offset")
+    stream.seek(offset)
+    pe = stream.read(6)
+    require(len(pe) == 6 and pe[:4] == b"PE\0\0", "invalid PE signature")
+    return int.from_bytes(pe[4:6], "little")
+
+
+def check_zip(path, root, architecture):
+    require(architecture in ARCHITECTURES, "ZIP architecture")
     with zipfile.ZipFile(path) as archive:
         members = zip_members(archive)
         files = set()
@@ -393,9 +443,20 @@ def check_zip(path, root):
                 files.add(name)
                 require(entry.file_size > 0, "empty package file")
                 with archive.open(entry) as stream:
+                    if name.casefold().endswith(".exe"):
+                        require(pe_machine(stream) == ARCHITECTURES[architecture]["machine"],
+                                "wrong PE machine type")
+                        stream.seek(0)
                     while stream.read(1024 * 1024):
                         pass
-        require(REQUIRED_FILES <= files, "missing Windows runtime/package files")
+        if architecture == "x86_64":
+            require(X64_REQUIRED_FILES <= files, "missing Windows runtime/package files")
+        else:
+            allowed = ARM64_EXECUTABLES | {
+                name.removesuffix(".exe") + ".pdb" for name in ARM64_EXECUTABLES
+            }
+            require(ARM64_EXECUTABLES <= files and files <= allowed,
+                    "ARM64 package file allowlist")
 
 
 def digest_file(path):
@@ -407,25 +468,79 @@ def digest_file(path):
 
 
 def checksum_bytes(manifest):
-    return f"{manifest['sha256']}  {manifest['asset_name']}\n".encode("ascii")
+    assets = manifest["assets"]["windows"]
+    return "".join(
+        f"{assets[architecture]['sha256']}  {assets[architecture]['name']}\n"
+        for architecture in sorted(assets)
+    ).encode("ascii")
+
+
+def record_common(snapshot, run_id, attempt):
+    build_id, _ = identity(snapshot["request"]["source_sha"], run_id, attempt)
+    value = {
+        "schema": 2, "source_repository": SOURCE_REPO,
+        "source_sha": snapshot["request"]["source_sha"], "build_repository": BUILD_REPO,
+        "run_id": run_id, "run_attempt": attempt, "build_id": build_id,
+        "version": snapshot["version"], "success": True,
+    }
+    value.update({key: snapshot["request"][key] for key in
+                  ("request_id", "requested_at", "nonce")})
+    return value
+
+
+def validate_record(obj, snapshot, run_id, attempt, architecture):
+    require(type(obj) is dict and set(obj) == RECORD_KEYS, "build record keys")
+    require(architecture in ARCHITECTURES and obj["architecture"] == architecture,
+            "build record architecture")
+    common = record_common(snapshot, run_id, attempt)
+    require(all(obj[key] == value for key, value in common.items()), "build record provenance")
+    require(obj["name"] == asset_name(architecture, common["build_id"]), "build record asset")
+    root = ("WezTerm-windows-" if architecture == "x86_64"
+            else "WezTerm-windows-aarch64-") + snapshot["version"]
+    require(obj["archive_root"] == root, "build record archive root")
+    require(hex_string(obj["sha256"], 64) and positive_int(obj["size"])
+            and obj["size"] <= MAX_ZIP, "build record checksum/size")
+    return obj
+
+
+def validate_build_package(directory, snapshot, run_id, attempt, architecture):
+    require(directory.is_dir() and not directory.is_symlink(), "package directory")
+    entries = list(directory.iterdir())
+    build_id, _ = identity(snapshot["request"]["source_sha"], run_id, attempt)
+    asset = asset_name(architecture, build_id)
+    require({item.name for item in entries} == {asset, "build-record.json"},
+            "build package file allowlist")
+    require(all(item.is_file() and not item.is_symlink() for item in entries), "package regular files")
+    record_path = directory / "build-record.json"
+    require(record_path.stat().st_size <= 16384, "build record too large")
+    record = validate_record(parse_json(record_path.read_bytes()), snapshot, run_id, attempt,
+                             architecture)
+    zip_path = directory / asset
+    require(zip_path.stat().st_size == record["size"]
+            and digest_file(zip_path) == record["sha256"], "archive checksum/size")
+    check_zip(zip_path, record["archive_root"], architecture)
+    return record
 
 
 def validate_package(directory, snapshot, run_id, attempt):
-    require(directory.is_dir() and not directory.is_symlink(), "package directory")
+    require(directory.is_dir() and not directory.is_symlink(), "release package directory")
     entries = list(directory.iterdir())
-    _, _, asset = identity(snapshot["request"]["source_sha"], run_id, attempt)
-    require({item.name for item in entries} == {asset, "provenance.json", "SHA256SUMS"},
-            "package file allowlist")
-    require(all(item.is_file() and not item.is_symlink() for item in entries), "package regular files")
     manifest_path = directory / "provenance.json"
-    require(manifest_path.stat().st_size <= 16384, "manifest too large")
+    require(manifest_path.is_file() and not manifest_path.is_symlink()
+            and manifest_path.stat().st_size <= 16384, "manifest file")
     manifest = validate_manifest(parse_json(manifest_path.read_bytes()), snapshot, run_id, attempt)
-    zip_path = directory / asset
-    require(zip_path.stat().st_size == manifest["size"]
-            and digest_file(zip_path) == manifest["sha256"], "archive checksum/size")
+    names = {asset["name"] for asset in manifest["assets"]["windows"].values()}
+    require({item.name for item in entries} == names | {"provenance.json", "SHA256SUMS"},
+            "release package file allowlist")
+    require(all(item.is_file() and not item.is_symlink() for item in entries),
+            "release package regular files")
+    for architecture, asset in manifest["assets"]["windows"].items():
+        path = directory / asset["name"]
+        require(path.stat().st_size == asset["size"] and digest_file(path) == asset["sha256"],
+                "archive checksum/size")
+        check_zip(path, asset["archive_root"], architecture)
     require((directory / "SHA256SUMS").stat().st_size <= 1024
             and (directory / "SHA256SUMS").read_bytes() == checksum_bytes(manifest), "SHA256SUMS")
-    check_zip(zip_path, manifest["archive_root"])
     return manifest
 
 
@@ -433,8 +548,8 @@ def unpack_artifact(path, destination, asset):
     require(not destination.exists(), "fresh incoming directory required")
     with zipfile.ZipFile(path) as archive:
         members = zip_members(archive)
-        require({entry.filename for entry in members} == {asset, "provenance.json", "SHA256SUMS"}
-                and len(members) == 3 and all(not entry.is_dir() for entry in members),
+        require({entry.filename for entry in members} == {asset, "build-record.json"}
+                and len(members) == 2 and all(not entry.is_dir() for entry in members),
                 "artifact file allowlist")
         for entry in members:
             limit = MAX_ZIP if entry.filename == asset else 16384
@@ -442,6 +557,24 @@ def unpack_artifact(path, destination, asset):
         destination.mkdir()
         for entry in members:
             with archive.open(entry) as source, (destination / entry.filename).open("xb") as output:
+                while chunk := source.read(1024 * 1024):
+                    output.write(chunk)
+
+
+def prepare_arm64_validation(directory, destination, snapshot, run_id, attempt):
+    record = validate_build_package(directory, snapshot, run_id, attempt, "aarch64")
+    require(not destination.exists(), "fresh validation destination required")
+    destination.mkdir()
+    with zipfile.ZipFile(directory / record["name"]) as archive:
+        members = zip_members(archive)
+        for entry in members:
+            if entry.is_dir():
+                continue
+            name = entry.filename[len(record["archive_root"]) + 1:]
+            if name not in ARM64_EXECUTABLES:
+                continue
+            require("/" not in name, "validation executable path")
+            with archive.open(entry) as source, (destination / name).open("xb") as output:
                 while chunk := source.read(1024 * 1024):
                     output.write(chunk)
 
@@ -473,20 +606,23 @@ def valid_release(api, release, source_sha, default, expected=None, completed=Tr
     require(release.get("immutable") is True, "release immutability must be enabled")
     manifest = validate_manifest(parse_json(
         release_asset_bytes(api, tag, "provenance.json", 16384)))
-    _, wanted_tag, asset_name = identity(source_sha, manifest["run_id"], manifest["run_attempt"])
+    _, wanted_tag = identity(source_sha, manifest["run_id"], manifest["run_attempt"])
     require(tag == wanted_tag and manifest["source_sha"] == source_sha, "release identity")
     require(manifest["version"] == source_version(api, source_sha), "release source version")
     if expected is not None:
         require(manifest == expected, "existing release differs; never overwrite")
     assets = release.get("assets", [])
-    require(len(assets) == 3 and {a["name"] for a in assets} ==
-            {asset_name, "provenance.json", "SHA256SUMS"}, "release assets")
+    asset_records = manifest["assets"]["windows"]
+    archive_names = {asset["name"] for asset in asset_records.values()}
+    require(len(assets) == 4 and {a["name"] for a in assets} ==
+            archive_names | {"provenance.json", "SHA256SUMS"}, "release assets")
     require(all(a.get("state") == "uploaded" for a in assets), "incomplete release assets")
-    archive = next(a for a in assets if a["name"] == asset_name)
-    require(archive.get("size") == manifest["size"]
-            and archive.get("digest") == "sha256:" + manifest["sha256"],
-            "release archive digest/size")
-    require(release_asset_bytes(api, tag, "SHA256SUMS", 1024) == checksum_bytes(manifest),
+    for record in asset_records.values():
+        archive = next(a for a in assets if a["name"] == record["name"])
+        require(archive.get("size") == record["size"]
+                and archive.get("digest") == "sha256:" + record["sha256"],
+                "release archive digest/size")
+    require(release_asset_bytes(api, tag, "SHA256SUMS", 2048) == checksum_bytes(manifest),
             "release checksum")
     run = prove_run(api, manifest["run_id"], manifest["run_attempt"], default, completed=completed)
     ref = api.get(f"/repos/{BUILD_REPO}/git/ref/tags/{tag}")
@@ -520,40 +656,58 @@ def poll(api):
         print("Source already has a durable successful release.")
         return
     recheck(api, snapshot)
-    build_id, _, _ = identity(source_sha, run_id, attempt)
+    build_id, _ = identity(source_sha, run_id, attempt)
     with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
         output.write("snapshot=" + canonical(snapshot) + "\n")
         output.write("build_id=" + build_id + "\n")
 
 
-def package(api):
+def package(api, architecture):
+    require(architecture in ARCHITECTURES, "package architecture")
     _, run_id, attempt = context(api)
     snapshot = validate_snapshot(parse_json(os.environ["SNAPSHOT"]))
     require(source_version(api, snapshot["request"]["source_sha"]) == snapshot["version"],
             "package upstream version")
     directory = Path("package")
     directory.mkdir()
-    build_id, _, asset = identity(snapshot["request"]["source_sha"], run_id, attempt)
-    original = Path("candidate") / ("WezTerm-windows-" + snapshot["version"] + ".zip")
-    require(original.is_file() and not original.is_symlink() and 0 < original.stat().st_size <= MAX_ZIP,
-            "upstream package ZIP")
-    check_zip(original, "WezTerm-windows-" + snapshot["version"])
+    build_id, _ = identity(snapshot["request"]["source_sha"], run_id, attempt)
+    asset = asset_name(architecture, build_id)
+    archive_root = ("WezTerm-windows-" if architecture == "x86_64"
+                    else "WezTerm-windows-aarch64-") + snapshot["version"]
+    if architecture == "x86_64":
+        original = Path("candidate") / ("WezTerm-windows-" + snapshot["version"] + ".zip")
+        require(original.is_file() and not original.is_symlink()
+                and 0 < original.stat().st_size <= MAX_ZIP, "upstream package ZIP")
+        check_zip(original, archive_root, architecture)
+    else:
+        release = Path("candidate/target/aarch64-pc-windows-msvc/release")
+        executables = [release / name for name in sorted(ARM64_EXECUTABLES)]
+        require(all(path.is_file() and not path.is_symlink() for path in executables),
+                "ARM64 release executables")
+        original = directory / (asset + ".staging")
+        with zipfile.ZipFile(original, "x", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+            for path in executables:
+                with path.open("rb") as stream:
+                    require(pe_machine(stream) == ARCHITECTURES[architecture]["machine"],
+                            "wrong ARM64 PE machine type")
+                archive.write(path, archive_root + "/" + path.name)
+                pdb = path.with_suffix(".pdb")
+                if pdb.is_file() and not pdb.is_symlink():
+                    archive.write(pdb, archive_root + "/" + pdb.name)
+        check_zip(original, archive_root, architecture)
     target = directory / asset
     with original.open("rb") as source, target.open("xb") as output:
         while chunk := source.read(1024 * 1024):
             output.write(chunk)
-    manifest = {
-        "schema": 1, "source_repository": SOURCE_REPO,
-        "source_sha": snapshot["request"]["source_sha"], "build_repository": BUILD_REPO,
-        "run_id": run_id, "run_attempt": attempt, "build_id": build_id,
-        "version": snapshot["version"], "archive_root": "WezTerm-windows-" + snapshot["version"],
-        "asset_name": asset, "sha256": digest_file(target), "size": target.stat().st_size,
-        "success": True,
-    }
-    manifest.update({key: snapshot["request"][key] for key in ("request_id", "requested_at", "nonce")})
-    (directory / "provenance.json").write_text(canonical(manifest) + "\n", encoding="utf-8")
-    (directory / "SHA256SUMS").write_bytes(checksum_bytes(manifest))
-    validate_package(directory, snapshot, run_id, attempt)
+    if architecture == "aarch64":
+        original.unlink()
+    record = record_common(snapshot, run_id, attempt)
+    record.update({
+        "name": asset, "architecture": architecture, "archive_root": archive_root,
+        "sha256": digest_file(target), "size": target.stat().st_size,
+    })
+    (directory / "build-record.json").write_text(canonical(record) + "\n", encoding="utf-8")
+    validate_build_package(directory, snapshot, run_id, attempt, architecture)
 
 
 def publish(api, own):
@@ -565,18 +719,44 @@ def publish(api, own):
     if successful_source(api, source_sha, default):
         print("Source already published successfully; no duplicate release.")
         return
-    require(numeric_string(os.environ.get("ARTIFACT_ID")), "artifact ID output")
-    artifact_id = int(os.environ["ARTIFACT_ID"])
-    build_id, tag, asset = identity(source_sha, run_id, attempt)
-    artifact = own.call("GET", f"/actions/artifacts/{artifact_id}")
-    require(artifact.get("id") == artifact_id and artifact.get("name") == "package-" + build_id
-            and artifact.get("expired") is False, "artifact identity")
-    metadata = artifact.get("workflow_run") or {}
-    require(metadata.get("id") == run_id and metadata.get("head_sha") == run["head_sha"]
-            and metadata.get("head_branch") == default, "artifact run provenance")
-    own.download_artifact(artifact_id, Path("artifact.zip"))
-    unpack_artifact(Path("artifact.zip"), Path("incoming"), asset)
-    manifest = validate_package(Path("incoming"), snapshot, run_id, attempt)
+    build_id, tag = identity(source_sha, run_id, attempt)
+    incoming = Path("incoming")
+    incoming.mkdir()
+    records = {}
+    for architecture, variable in (("x86_64", "ARTIFACT_X64_ID"),
+                                   ("aarch64", "ARTIFACT_ARM64_ID")):
+        require(numeric_string(os.environ.get(variable)), "artifact ID output")
+        artifact_id = int(os.environ[variable])
+        artifact = own.call("GET", f"/actions/artifacts/{artifact_id}")
+        require(artifact.get("id") == artifact_id
+                and artifact.get("name") == f"package-{architecture}-{build_id}"
+                and artifact.get("expired") is False, "artifact identity")
+        metadata = artifact.get("workflow_run") or {}
+        require(metadata.get("id") == run_id and metadata.get("head_sha") == run["head_sha"]
+                and metadata.get("head_branch") == default, "artifact run provenance")
+        artifact_path = Path(f"artifact-{architecture}.zip")
+        own.download_artifact(artifact_id, artifact_path)
+        artifact_directory = Path(f"incoming-{architecture}")
+        asset = asset_name(architecture, build_id)
+        unpack_artifact(artifact_path, artifact_directory, asset)
+        records[architecture] = validate_build_package(
+            artifact_directory, snapshot, run_id, attempt, architecture)
+        with (artifact_directory / asset).open("rb") as source, \
+                (incoming / asset).open("xb") as output:
+            while chunk := source.read(1024 * 1024):
+                output.write(chunk)
+    manifest = record_common(snapshot, run_id, attempt)
+    manifest["assets"] = {"windows": {
+        architecture: {
+            "name": record["name"], "architecture": architecture,
+            "archive_root": record["archive_root"], "sha256": record["sha256"],
+            "size": record["size"],
+        }
+        for architecture, record in records.items()
+    }}
+    (incoming / "provenance.json").write_text(canonical(manifest) + "\n", encoding="utf-8")
+    (incoming / "SHA256SUMS").write_bytes(checksum_bytes(manifest))
+    manifest = validate_package(incoming, snapshot, run_id, attempt)
     recheck(api, snapshot)
     existing = own.optional("/releases/tags/" + tag)
     if existing is not None:
@@ -599,7 +779,9 @@ def publish(api, own):
     })
     require(positive_int(release.get("id")) and release.get("draft") is True, "new draft")
     release_id = release["id"]
-    for name in (asset, "provenance.json", "SHA256SUMS"):
+    release_names = [manifest["assets"]["windows"][architecture]["name"]
+                     for architecture in sorted(ARCHITECTURES)]
+    for name in release_names + ["provenance.json", "SHA256SUMS"]:
         payload = (Path("incoming") / name).read_bytes()
         uploaded = own.call("POST", f"/releases/{release_id}/assets?name={name}",
                             payload, content_type="application/octet-stream", upload=True)
@@ -619,12 +801,26 @@ def publish(api, own):
 
 
 def main():
-    require(len(sys.argv) == 2 and sys.argv[1] in ("poll", "package", "publish"), "command")
+    require(len(sys.argv) >= 2 and sys.argv[1] in
+            ("poll", "package", "publish", "validate-arm64"), "command")
     api = PublicAPI()
     if sys.argv[1] == "publish":
+        require(len(sys.argv) == 2, "publish arguments")
         publish(api, OwnAPI(os.environ.get("GITHUB_TOKEN")))
+    elif sys.argv[1] == "package":
+        require(len(sys.argv) == 3, "package arguments")
+        package(api, sys.argv[2])
+    elif sys.argv[1] == "validate-arm64":
+        require(len(sys.argv) == 2, "validation arguments")
+        snapshot = validate_snapshot(parse_json(os.environ["SNAPSHOT"]))
+        require(numeric_string(os.environ.get("GITHUB_RUN_ID"))
+                and numeric_string(os.environ.get("GITHUB_RUN_ATTEMPT")), "run identity")
+        prepare_arm64_validation(Path("arm-package"), Path("arm-smoke"), snapshot,
+                                 int(os.environ["GITHUB_RUN_ID"]),
+                                 int(os.environ["GITHUB_RUN_ATTEMPT"]))
     else:
-        {"poll": poll, "package": package}[sys.argv[1]](api)
+        require(len(sys.argv) == 2, "poll arguments")
+        poll(api)
 
 
 if __name__ == "__main__":

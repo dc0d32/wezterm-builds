@@ -32,7 +32,11 @@ def cache_plan(identity, lock, source, scripts, nextest_version=NEXTEST_VERSION)
         raise ValueError("Incomplete build environment identity")
     if identity["os"] != "Windows" or identity["arch"] != "X64":
         raise ValueError("Unsupported runner")
-    if identity["target"] != "x86_64-pc-windows-msvc":
+    targets = {
+        "x86_64-pc-windows-msvc": "X64",
+        "aarch64-pc-windows-msvc": "ARM64",
+    }
+    if identity["target"] not in targets:
         raise ValueError("Unsupported target")
     for field in IDENTITY_FIELDS - {"environment"}:
         if not isinstance(identity[field], str) or not identity[field].strip():
@@ -52,7 +56,7 @@ def cache_plan(identity, lock, source, scripts, nextest_version=NEXTEST_VERSION)
         {"identity": identity, "scripts": scripts}, sort_keys=True,
         separators=(",", ":"), ensure_ascii=True,
     ).encode())
-    base = f"{CACHE_SCHEMA}-Windows-X64-{scope}"
+    base = f"{CACHE_SCHEMA}-Windows-{targets[identity['target']]}-{scope}"
     revision = f"{digest(lock)}-{source}"
     return {
         "registry_key": f"{base}-registry-{revision}",
