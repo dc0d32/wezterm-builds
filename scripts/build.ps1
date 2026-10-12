@@ -160,7 +160,8 @@ if ($Architecture -eq 'x86_64') {
     }
     # Executing this check is intentionally inside the token-free compile boundary.
     # A corrupt hit fails the build; never silently reinstall or suppress failures.
-    $toolVersion = (Invoke-Checked $nextest @('nextest', '--version')).Trim()
+    # -V reports the short version; --version includes multiline build metadata.
+    $toolVersion = (Invoke-Checked $nextest @('nextest', '-V')).Trim()
     Invoke-Checked python @('-B', 'control/scripts/build_cache.py', 'check-nextest-version', $toolVersion)
 }
 Push-Location candidate

@@ -166,6 +166,30 @@ class IdentityTests(unittest.TestCase):
             with self.subTest(kind=kind, fallback=fallback), self.assertRaises(ValueError):
                 restore.validate_keys(kind, PLAN[kind + "_key"], fallback, PLAN)
 
+    def test_both_target_architectures_require_exact_prepared_scope(self):
+        for architecture in ("X64", "ARM64"):
+            plan = {name: value.replace("-X64-", f"-{architecture}-")
+                    for name, value in PLAN.items()}
+            for kind in PATHS:
+                primary = plan[kind + "_key"]
+                fallback = plan.get(kind + "_restore", "")
+                with self.subTest(architecture=architecture, kind=kind):
+                    restore.validate_keys(kind, primary, fallback, plan)
+                    for other in ("X64", "ARM64", "X86", "arm64"):
+                        if other == architecture:
+                            continue
+                        wrong = primary.replace(f"-{architecture}-", f"-{other}-")
+                        with self.assertRaises(ValueError):
+                            restore.validate_keys(kind, wrong, fallback, plan)
+                    wrong_plan = {
+                        name: value.replace(f"-{architecture}-", "-X86-")
+                        for name, value in plan.items()
+                    }
+                    with self.assertRaises(ValueError):
+                        restore.validate_keys(
+                            kind, wrong_plan[kind + "_key"],
+                            wrong_plan.get(kind + "_restore", ""), wrong_plan)
+
 
 class UrlTests(unittest.TestCase):
     def test_https_runtime_and_blob_hosts_allow_only_exact_suffix_boundaries(self):
@@ -1230,6 +1254,42 @@ class RunTests(WorkspaceCase):
                 self.assertFalse(self.output.exists())
         with mock.patch.object(restore, "lookup", return_value=("", "")):
             restore.run({**self.env, "GITHUB_EVENT_NAME": "workflow_dispatch"}, self.workspace)
+
+    def test_arm64_cache_hits_fallbacks_and_misses_on_x64_runner(self):
+        plan = {name: value.replace("-X64-", "-ARM64-")
+                for name, value in PLAN.items()}
+        (self.workspace / ".build-cache-plan.json").write_text(
+            json.dumps(plan), encoding="utf-8")
+        for kind in ("registry", "target"):
+            primary = plan[kind + "_key"]
+            fallback = plan[kind + "_restore"]
+            self.env.update(CACHE_PATH=PATHS[kind], CACHE_KEY=primary,
+                            CACHE_RESTORE_KEYS=fallback)
+            for matched, hit in (
+                    (primary, "true"), (fallback + LOCK + "-" + "d" * 40
+                                       if kind == "registry" else fallback + "d" * 40, "false"),
+                    ("", "false")):
+                with self.subTest(kind=kind, matched=matched):
+                    if self.output.exists():
+                        self.output.unlink()
+                    reply = {"ok": True, "matched_key": matched,
+                             "signed_download_url": BLOB_URL} if matched else {}
+                    with mock.patch.object(restore, "open_request", return_value=Response(
+                            json.dumps(reply).encode())), \
+                            mock.patch.object(restore, "safe_restore") as safe:
+                        restore.run(self.env, self.workspace)
+                        if matched:
+                            safe.assert_called_once_with(self.workspace, PATHS[kind], BLOB_URL)
+                        else:
+                            safe.assert_not_called()
+                    self.assertEqual(self.outputs(), [
+                        "cache-hit=" + hit, "cache-matched-key=" + matched])
+            with mock.patch.object(restore, "lookup", return_value=(
+                    PLAN[kind + "_key"], BLOB_URL)), \
+                    mock.patch.object(restore, "safe_restore") as safe:
+                with self.assertRaises(ValueError):
+                    restore.run(self.env, self.workspace)
+                safe.assert_not_called()
 
     def test_inputs_cannot_override_prepared_plan(self):
         for field, value in (

@@ -23,7 +23,7 @@ MAX_EXPANDED = 30 * 1024 ** 3
 MAX_MEMBERS = 300000
 TIMEOUT = 1800
 ROUTE = "/twirp/github.actions.results.api.v1.CacheService/GetCacheEntryDownloadURL"
-KEY = re.compile(r"wt-win-v1-Windows-X64-[0-9a-f]{64}-(?:registry-[0-9a-f]{64}-[0-9a-f]{40}|target-[0-9a-f]{64}-[0-9a-f]{40}|nextest-\d+\.\d+\.\d+)")
+KEY = re.compile(r"wt-win-v1-Windows-(?:X64|ARM64)-[0-9a-f]{64}-(?:registry-[0-9a-f]{64}-[0-9a-f]{40}|target-[0-9a-f]{64}-[0-9a-f]{40}|nextest-\d+\.\d+\.\d+)")
 
 
 def cache_version(path):

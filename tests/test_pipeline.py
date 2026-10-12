@@ -1484,6 +1484,8 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("-Ctarget-feature=+crt-static", self.script)
 
     def test_x64_preserves_native_nextest_and_upstream_packaging(self):
+        self.assertIn("Invoke-Checked $nextest @('nextest', '-V')", self.script)
+        self.assertNotIn("Invoke-Checked $nextest @('nextest', '--version')", self.script)
         self.assertIn("'nextest', 'run', '--locked', '--all', '--no-fail-fast'", self.script)
         self.assertIn("ci/deploy.sh", self.script)
         self.assertIn("if ($Architecture -eq 'x86_64')", self.script)
