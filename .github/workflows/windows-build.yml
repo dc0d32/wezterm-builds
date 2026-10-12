@@ -1,0 +1,87 @@
+name: Windows build
+
+on:
+  schedule:
+    - cron: '23 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-publication
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    if: >-
+      github.repository == 'dc0d32/wezterm-builds' &&
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      snapshot: ${{ steps.poll.outputs.snapshot }}
+      build_id: ${{ steps.poll.outputs.build_id }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - run: python3 -B -m unittest discover -s tests -v
+      - id: poll
+        run: python3 -B scripts/pipeline.py poll
+
+  build:
+    needs: poll
+    if: needs.poll.outputs.snapshot != ''
+    runs-on: windows-2025
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+    env:
+      SNAPSHOT: ${{ needs.poll.outputs.snapshot }}
+      CARGO_INCREMENTAL: '0'
+      RUSTUP_WINDOWS_PATH_ADD_BIN: '1'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Compile, check and package exact upstream commit
+        shell: pwsh
+        run: ./control/scripts/build.ps1
+      - id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: package-${{ fromJSON(needs.poll.outputs.snapshot).request.source_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: package/*
+          if-no-files-found: error
+          overwrite: false
+          compression-level: 0
+          retention-days: 7
+
+  publish:
+    needs: [poll, build]
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+      actions: read
+    env:
+      SNAPSHOT: ${{ needs.poll.outputs.snapshot }}
+      ARTIFACT_ID: ${{ needs.build.outputs.artifact_id }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          path: control
+          persist-credentials: false
+      - name: Validate data and publish without executing candidate code
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 -B control/scripts/pipeline.py publish

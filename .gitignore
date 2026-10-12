@@ -1,0 +1,6 @@
+__pycache__/
+candidate/
+package/
+incoming/
+.test-work/
+artifact.zip

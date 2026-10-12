@@ -1,0 +1,256 @@
+dc0d32/wezterm-builds — public, Windows-only build service
+=========================================================
+
+This directory is a complete repository payload, not an activated deployment.
+The empty public dc0d32/wezterm-builds repository has been created with owner
+approval. No commit, push or release has been published.
+
+Owner bootstrap (manual; not performed by the agent)
+----------------------------------------------------
+1. Use the existing empty PUBLIC dc0d32/wezterm-builds repository on GitHub.
+   Use main as its default branch. Copy this directory's contents into its
+   working tree, including .github/, .gitattributes and .gitignore.
+   Do not copy any surrounding nixos repository files.
+2. Review and commit the payload, then push main. No PAT, app, deploy key,
+   repository secret, upstream credential or repository-dispatch token is
+   required. Use GitHub-hosted runners, not self-hosted runners.
+3. Settings > Actions > General: enable Actions and allow the SHA-pinned
+   actions/checkout and actions/upload-artifact. The default workflow token
+   may remain read-only: only publish requests contents: write and actions:
+   read. No PR creation permission is required or used here.
+4. Settings > General > Releases: enable "Release immutability".
+   This is REQUIRED for successful publication. GitHub's REST "immutable"
+   field is response-only, not a documented create/update input.
+   We create a draft, attach verified assets, then publish it, and require
+   immutable=true in the returned release. Never send a fictitious flag.
+   If the feature is unavailable, this pipeline fails verification; it does
+   not claim an editable release is immutable. The documented GET
+   /repos/{owner}/{repo}/immutable-releases requires admin read access, which
+   GITHUB_TOKEN's contents: write does not provide. Do not broaden the token
+   or add a PAT to preflight this setting. The owner must enable it first.
+   A setup mistake is detected after the draft-to-public transition: that
+   normal but editable release leaves a FAILED run, cannot be deduped/adopted,
+   and is never overwritten by this service. This is a platform limitation,
+   not a claim of an atomic immutability-setting check.
+5. Protect main (restrict writes and require review of workflows/scripts).
+   This service intentionally has no pull_request/push/workflow_run triggers.
+   Only default-branch schedule and workflow_dispatch runs are accepted.
+6. Keep the coordinator's PR OPEN while building. It must be a same-repository
+   dc0d32/nixos PR from automation/update-flake-lock against nixos's current
+   default branch, carrying the request at .github/wezterm-request.json.
+7. Run the "Windows build" workflow manually on main, or wait for the hourly
+   :23 poll. GitHub schedules are best-effort and may be delayed/dropped;
+   inactivity can disable schedules on public repositories after 60 days.
+   Re-enable if needed. API rate limits produce a failed, closed poll; no
+   authentication fallback to nixos/wezterm is permitted.
+
+Local verification (Python >= 3.9; stdlib only)
+-----------------------------------------------
+    python3 -B -m unittest discover -s tests -v
+No fixture uses tempfile, mktemp or /tmp. Fixtures are UUID directories under
+tests/.test-work and cleaned after each test. On Windows Python is supplied by
+windows-2025 and the build uses PowerShell 7, Git bash, stable Rust/MSVC,
+Strawberry Perl, 7-Zip and Inno Setup 6 from the hosted runner image.
+The Windows build itself must be verified with a real GitHub Actions run.
+
+Request contract / coordinator handoff
+--------------------------------------
+Exactly eight keys are accepted (no other fields, duplicate keys or coercions):
+    schema             integer 1 (not bool)
+    repository         "dc0d32/nixos"
+    branch             "automation/update-flake-lock"
+    source_repository  "wezterm/wezterm"
+    source_sha         40 lowercase hexadecimal characters
+    request_id         64 lowercase hexadecimal characters
+    requested_at       ISO UTC YYYY-MM-DDTHH:MM:SS[.ffffff]Z
+    nonce              positive numeric STRING containing coordinator github.run_id
+
+The nonce is the explicitly requested ADDITION to the coordinator schema:
+    material = "dc0d32/nixos\nautomation/update-flake-lock\n" +
+               source_sha + "\n" + nonce
+    request_id = SHA256(material encoded as UTF-8).hexdigest()
+There is NO trailing newline after nonce. This hash binds request identity,
+not cryptographic authentication; admission comes from the fixed repository,
+branch, PR and default-branch checks. A branch update of any kind supersedes
+the captured request, even if it retains the same request_id. Forks, merged
+or closed PRs, changed default base, ambiguous PRs and branch-ref/PR-head
+disagreement are rejected. We fetch the file at the PR's immutable head SHA
+and confirm wezterm/wezterm's anonymous exact-commit API returns source_sha.
+An invalid/missing request fails closed; no eligible PR is a successful no-op.
+
+Public release contract
+------------------------
+    build_id = source_sha + "-" + run_id + "-" + run_attempt
+    tag      = "wezterm-" + build_id
+    archive  = "WezTerm-windows-" + build_id + ".zip"
+There are exactly three release assets: archive, provenance.json, SHA256SUMS.
+SHA256SUMS contains exactly: "<archive-sha256>  <archive-name>\n".
+
+provenance.json contains the REQUIRED coordinator fields:
+    schema=1, source_repository="wezterm/wezterm", source_sha,
+    build_repository="dc0d32/wezterm-builds", run_id (positive integer),
+    run_attempt (positive integer), build_id, version, archive_root,
+    asset_name, sha256 (lowercase hex), size (positive integer), success=true.
+Additional provenance keys: request_id, requested_at, nonce (the same values
+as the accepted request). No new coordinator-required manifest fields.
+
+version is the upstream timestamp tag format YYYYMMDD-HHMMSS-<short-sha8>,
+derived from the exact upstream committer date, explicitly normalized to UTC.
+It is written to upstream's .tag before compilation. archive_root is
+"WezTerm-windows-" + version, not the source/run/attempt build_id.
+The outer asset is renamed without rewriting upstream's ZIP.
+
+The coordinator must accept an existing successful release for the SAME
+source_sha even when its request_id differs. It should check manifest,
+release assets/digest and workflow run provenance rather than demand that
+the current request created a fresh duplicate release.
+
+Run provenance expected by coordinator:
+    workflow filename: windows-build.yml
+    API run path: ".github/workflows/windows-build.yml"
+    event: schedule or workflow_dispatch
+    head_repository.full_name: "dc0d32/wezterm-builds"
+    head_branch: repository's default branch
+    run_id/run_attempt: manifest's exact numeric values
+    job "build": completed, conclusion success, same run_attempt
+    job "publish": publisher (never upstream code)
+The publisher checks this proof before publication. The release can become
+visible while publish is running. The coordinator MUST wait for that run
+attempt to complete successfully before adopting the pin.
+
+Durability, retries and retention
+---------------------------------
+Each poll and publisher paginates all releases and finds any normal immutable
+successful release for source_sha, independently of request identity. It
+checks manifest schema, naming, source version, asset digest/size/checksum,
+the exact workflow and same-attempt successful build, the release tag's
+commit matching the proven workflow head, and overall completed successful
+run. Public asset reads have bounded 1/2/4/8/16-second backoff for
+transient CDN visibility/network failures; integrity errors never retry.
+There is no expiring dedup artifact or mutable "latest" tag.
+Retain successful releases AND their workflow-run records permanently: the
+records are part of the coordinator's proof. Artifact retention is only seven
+days and has no bearing on already published releases.
+
+No --clobber, overwrite, deletion, force-tagging, latest/nightly mutation or
+tag reuse exists. A new lightweight tag is reserved with atomic POST git/refs
+(never PATCH) before drafting; a tag created by another writer between the
+GET and POST is rejected, not adopted. Existing identical successful releases are a read-only
+no-op. Any conflicting existing tag/draft fails, not resumes or overwrites.
+Failure before visibility can leave a draft: do not reuse its tag. Rerun ALL
+jobs, which increments run_attempt and yields a new permanent identity.
+Rerunning only publish cannot reuse an earlier attempt's build proof/artifact;
+it is deliberately rejected. Rerunning a failed build derives upload naming
+from the new current attempt even when the previous poll output is retained.
+If publication succeeded but the run later failed, it is not dedup/adoptable;
+rerun all jobs for a new attempt. Never delete a successful release to retry.
+
+Security boundaries and unavoidable limits
+-------------------------------------------
+poll: anonymous public HTTP reads only, read-only default-branch checkout.
+build: fresh Windows VM, contents: read, persist-credentials: false; exact
+upstream clone plus recursive submodules, no GITHUB_TOKEN/secret in the build
+environment; no credential persistence, write token or shared build cache.
+Upstream Cargo build scripts, tests and deploy.sh execute ONLY here.
+publish: separate Ubuntu VM; fresh trusted build-repo checkout at workflow
+head SHA; never checks out nixos PR or upstream, and never executes ZIP data.
+Its own GITHUB_TOKEN addresses only allowlisted dc0d32/wezterm-builds API
+routes; external nixos/wezterm/release reads are anonymous, and redirects
+strip Authorization. Own artifact downloads use actions: read.
+
+The publisher checks the artifact ID/name/run/head SHA, safely unpacks only
+the three allowed top-level files, validates JSON keys/types/identity, archive
+SHA256/size and SHA256SUMS, and scans every ZIP entry and CRC without extraction.
+It rejects traversal/absolute paths/backslashes/ADS/Windows device names,
+duplicate or case-colliding entries, symlinks/special entries, encrypted or
+unsupported compression, unexpected roots/missing runtime files and size
+bombs. It rechecks the PR/request before download, before drafting and
+immediately before the draft-to-public transition. A superseded draft stays
+unpublished. GitHub APIs offer no atomic cross-repository "publish only if PR
+still open" transaction: there is an irreducible interval after the final
+read. The coordinator must recheck its own request before adopting any pin.
+
+All workflow runs share a non-cancelling concurrency group to avoid two
+publishers racing. GitHub may coalesce pending runs; later hourly polling is
+the retry mechanism. Anonymous API rate limits can delay work.
+Rust stable, Windows runner tools and Cargo dependencies are not vendored
+into this service: this is provenance-addressed, not a bit-reproducible build.
+No claim of Windows code signing or upstream tests' malicious-code safety.
+Do not add a write token, cache-save privilege, external secrets, PR trigger,
+repository_dispatch trigger or upstream checkout to publish.
+
+Reviewed upstream and action metadata
+--------------------------------------
+Inspected public upstream commit:
+    e2a98e1b8af156988ad0ac778658ac27b60a55fb
+Its ci/deploy.ps1 does not exist; the anonymous history query returns []:
+    https://api.github.com/repos/wezterm/wezterm/commits?path=ci/deploy.ps1&per_page=1
+The actual Windows workflows build four Rust binaries, vendor locked Cargo
+dependencies, test, and run bash ci/deploy.sh. We use Cargo's lib/bin/integration
+test targets rather than Nextest, without compiling benchmark targets: the
+bootstrap revision's wcwidth benchmark has undeclared criterion/termwiz
+dependencies. We follow the upstream packaging route, including
+the required DLLs, PDB, Mesa runtime and upstream ZIP root; an EXE installer
+is built by upstream's script but is deliberately not published.
+    https://github.com/wezterm/wezterm/blob/e2a98e1b8af156988ad0ac778658ac27b60a55fb/.github/workflows/gen_windows.yml
+    https://github.com/wezterm/wezterm/blob/e2a98e1b8af156988ad0ac778658ac27b60a55fb/.github/workflows/gen_windows_continuous.yml
+    https://github.com/wezterm/wezterm/blob/e2a98e1b8af156988ad0ac778658ac27b60a55fb/ci/deploy.sh
+    https://github.com/wezterm/wezterm/blob/e2a98e1b8af156988ad0ac778658ac27b60a55fb/ci/tag-name.sh
+    https://github.com/wezterm/wezterm/blob/e2a98e1b8af156988ad0ac778658ac27b60a55fb/wezterm-version/build.rs
+
+ALL actions used (full commit SHAs; no moving tags):
+    actions/checkout v5
+    fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    https://api.github.com/repos/actions/checkout/commits/v5
+    https://api.github.com/repos/actions/checkout/commits/fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09
+    https://raw.githubusercontent.com/actions/checkout/fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09/action.yml
+    Reviewed Node24 action inputs/ref/submodules/persist-credentials defaults;
+    commit verified=true; message "backport fixes to releases-v5 (#2523)".
+    Source reviewed: finally removes auth when persistCredentials is false:
+    https://raw.githubusercontent.com/actions/checkout/fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09/src/git-source-provider.ts
+
+    actions/upload-artifact v4
+    ea165f8d65b6e75b540449e92b4886f43607fa02
+    https://api.github.com/repos/actions/upload-artifact/commits/v4
+    https://api.github.com/repos/actions/upload-artifact/commits/ea165f8d65b6e75b540449e92b4886f43607fa02
+    https://raw.githubusercontent.com/actions/upload-artifact/ea165f8d65b6e75b540449e92b4886f43607fa02/action.yml
+    Reviewed Node20 immutable artifact ID and overwrite=false inputs;
+    commit verified=true; release v4.6.2 merge (#685).
+    Source reviewed: deletion is gated on overwrite; false never deletes:
+    https://raw.githubusercontent.com/actions/upload-artifact/ea165f8d65b6e75b540449e92b4886f43607fa02/src/upload/upload-artifact.ts
+No download/setup/cache/Rust third-party action is used: trusted Python safely
+downloads the own-repo artifact, and the hosted image supplies build tools.
+
+GitHub immutability/API references:
+    https://docs.github.com/en/rest/releases/releases#create-a-release
+    https://docs.github.com/en/repositories/releasing-projects-on-github/managing-releases-in-a-repository
+    https://docs.github.com/en/code-security/how-tos/secure-your-supply-chain/establish-provenance-and-integrity/prevent-release-changes
+    https://docs.github.com/en/rest/repos/repos#check-if-immutable-releases-are-enabled-for-a-repository
+    https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json
+The last two document the admin-read prerequisite for immutability preflight;
+we deliberately do not widen publication's token permissions.
+Hosted Windows tool inventory reviewed:
+    https://raw.githubusercontent.com/actions/runner-images/main/images/windows/Windows2025-Readme.md
+
+Implementation verification (2026-10-11)
+---------------------------------------
+    python3 -B -m unittest discover -s tests -q
+    Result: 62 tests passed, including mocked full publication, race rejection,
+    source dedup across request identities, rerun naming, run/attempt proof,
+    ZIP/path/CRC/checksum validation, atomic tag creation races, tag/run binding,
+    bounded CDN retries and token boundaries.
+    No prior repository/test suite existed in this initially absent directory.
+    Initial regression failures were corrected before the final passing run.
+    Ruby's installed YAML parser: workflow parsed successfully; exact job set
+    poll/build/publish and read-only build/write-only publish permissions verified.
+    Python ast.parse: all Python files passed.
+    Byte scan: all persisted files LF; no fixtures, __pycache__ or artifact.zip
+    remained after tests.
+    Live PublicAPI source_version on exact reviewed upstream SHA returned:
+    20261010-073911-e2a98e1b
+    Real public Actions API run/job samples confirmed path and run_attempt fields.
+
+Not performed: Windows compilation/PowerShell execution (Darwin host lacks
+pwsh/MSVC), hosted workflow or actual release, remote creation, git commit,
+git push, or any changes to the source repository or its active pins.
+End-to-end hosted verification requires the owner's manual bootstrap.
