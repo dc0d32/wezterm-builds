@@ -43,7 +43,8 @@ class CompilerSetupTests(unittest.TestCase):
             ("lib.exe", "archiver"),
         ):
             self.assertIn(
-                f"${variable} = (Get-Command {executable} -CommandType Application).Source",
+                f"${variable} = (Get-Command {executable} -CommandType Application "
+                "| Select-Object -First 1).Source",
                 SETUP,
             )
         self.assertIn("$env:AR_aarch64_pc_windows_msvc = $archiver", ARM64)
@@ -55,6 +56,31 @@ class CompilerSetupTests(unittest.TestCase):
             "'-Ctarget-feature=+crt-static'",
             ARM64,
         )
+
+    @unittest.skipUnless(shutil.which("pwsh"), "local PowerShell unavailable")
+    def test_multiple_tool_matches_select_only_first_path_with_spaces(self):
+        selection = "\n".join(
+            line for line in SETUP.splitlines()
+            if line.startswith(("$msvcCompiler = ", "$linker = ", "$archiver = "))
+        )
+        script = r"""
+function Get-Command {
+    param($Name, $CommandType)
+    [pscustomobject]@{ Source = "C:\Program Files\MSVC\HostX64\ARM64\$Name" }
+    [pscustomobject]@{ Source = "C:\Program Files\MSVC\HostX64\x64\$Name" }
+}
+""" + selection + r"""
+foreach ($tool in @($msvcCompiler, $linker, $archiver)) {
+    if ($tool -isnot [string] -or $tool -notlike '*\ARM64\*') {
+        throw 'Expected one target-tool path, not combined target and host tools'
+    }
+}
+"""
+        result = subprocess.run(
+            [shutil.which("pwsh"), "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_identity_hashes_target_and_host_native_tools(self):
         native = next(line for line in SETUP.splitlines() if "native = " in line)

@@ -105,10 +105,11 @@ foreach ($line in $nativeEnvironment) {
 }
 $env:PATH = "C:\Strawberry\perl\bin;C:\Program Files\Inno Setup 6;$env:PATH"
 $env:CARGO_BUILD_TARGET = if ($Architecture -eq 'aarch64') { $target } else { $null }
-$msvcCompiler = (Get-Command cl.exe -CommandType Application).Source
+# VsDevCmd exposes target and host tool directories; Get-Command can return both.
+$msvcCompiler = (Get-Command cl.exe -CommandType Application | Select-Object -First 1).Source
 $compiler = $msvcCompiler
-$linker = (Get-Command link.exe -CommandType Application).Source
-$archiver = (Get-Command lib.exe -CommandType Application).Source
+$linker = (Get-Command link.exe -CommandType Application | Select-Object -First 1).Source
+$archiver = (Get-Command lib.exe -CommandType Application | Select-Object -First 1).Source
 if ($Architecture -eq 'aarch64') {
     $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS = '-Ctarget-feature=+crt-static'
     # LLVM precedent: https://github.com/wezterm/wezterm/issues/7802.
