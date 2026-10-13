@@ -774,7 +774,12 @@ def publish(api, own):
         "tag_name": tag, "target_commitish": run["head_sha"], "name": tag,
         "body": f"Exact {SOURCE_REPO}@{source_sha}\nRequest {snapshot['request']['request_id']}\n"
                 f"Run https://github.com/{BUILD_REPO}/actions/runs/{run_id}/attempts/{attempt}\n"
-                "Permanent assets: never overwrite or delete successful releases.",
+                "Permanent assets: never overwrite or delete successful releases.\n\n"
+                "Windows ARM64: set `front_end = \"WebGpu\"` in the table returned by "
+                "`wezterm.lua` if the default OpenGL frontend cannot start. "
+                "ARM64 packages use Windows' system ConPTY and do not bundle "
+                "ConPTY/OpenConsole or ANGLE/Mesa runtime DLLs. "
+                "Native GUI smoke coverage uses WebGPU, not default-config OpenGL.",
         "draft": True, "prerelease": False, "make_latest": "false",
     })
     require(positive_int(release.get("id")) and release.get("draft") is True, "new draft")

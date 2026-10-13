@@ -958,6 +958,12 @@ class ControlPlaneTests(WorkspaceCase):
         self.assertEqual(pipeline.successful_source(api, SOURCE, "main"), api.releases[0])
         mutations = [call.args[0] for call in own.call.call_args_list if call.args[0] != "GET"]
         self.assertEqual(mutations, ["POST", "POST", "POST", "POST", "POST", "POST", "PATCH"])
+        release = next(call.args[2] for call in own.call.call_args_list
+                       if call.args[:2] == ("POST", "/releases"))
+        self.assertIn('front_end = "WebGpu"', release["body"])
+        self.assertIn("Windows' system ConPTY", release["body"])
+        self.assertIn("do not bundle", release["body"])
+        self.assertIn("not default-config OpenGL", release["body"])
 
     def test_publish_dedup_across_request_identities_never_downloads_or_writes(self):
         api = FakePublic(snapshot("67891"))
@@ -1490,6 +1496,35 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("ci/deploy.sh", self.script)
         self.assertIn("if ($Architecture -eq 'x86_64')", self.script)
         self.assertIn(r"C:\Program Files\Git\bin\bash.exe", self.script)
+
+    def test_local_packages_are_cleaned_in_debug_and_release_before_build(self):
+        cleanup = self.script.split("foreach ($package in $metadata.packages)", 1)[1].split(
+            "$releaseDir =", 1)[0]
+        self.assertIn("if ($null -eq $package.source)", cleanup)
+        self.assertIn("$cleanArgs = @('clean', '--package', $package.id)", cleanup)
+        self.assertIn(
+            "if ($Architecture -eq 'aarch64') { $cleanArgs += @('--target', $target) }",
+            cleanup)
+        self.assertIn("Invoke-Checked cargo ($cleanArgs + @('--profile', 'dev'))", cleanup)
+        self.assertIn("Invoke-Checked cargo ($cleanArgs + @('--release'))", cleanup)
+        self.assertLess(self.script.index("Invoke-Checked cargo ($cleanArgs + @('--release'))"),
+                        self.script.index('throw "Stale workspace executable: $exe"'))
+        self.assertLess(self.script.index('throw "Stale workspace executable: $exe"'),
+                        self.script.index("Invoke-Checked cargo $buildArgs"))
+
+    def test_only_known_workspace_output_aliases_are_removed_before_build(self):
+        cleanup = self.script.split("$outputDirs =", 1)[1].split("$buildArgs =", 1)[0]
+        self.assertIn(
+            "@('target/debug', 'target/release', \"target/$target/debug\", \"target/$target/release\")",
+            cleanup)
+        self.assertIn(
+            "@('wezterm', 'wezterm-gui', 'wezterm-mux-server', 'strip-ansi-escapes')",
+            cleanup)
+        self.assertIn("foreach ($extension in @('exe', 'pdb', 'd'))", cleanup)
+        self.assertIn('Remove-Item -LiteralPath $output -Force', cleanup)
+        self.assertNotIn("-Recurse", cleanup)
+        self.assertNotIn("*", cleanup)
+        self.assertLess(cleanup.index("Remove-Item"), cleanup.index("Stale workspace executable"))
 
     def test_arm64_compiles_tests_without_running_and_never_uses_upstream_packaging(self):
         self.assertIn("'test', '--locked', '--all', '--no-run', '--target', $target", self.script)

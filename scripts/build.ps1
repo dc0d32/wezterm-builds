@@ -105,11 +105,27 @@ foreach ($line in $nativeEnvironment) {
 }
 $env:PATH = "C:\Strawberry\perl\bin;C:\Program Files\Inno Setup 6;$env:PATH"
 $env:CARGO_BUILD_TARGET = if ($Architecture -eq 'aarch64') { $target } else { $null }
+$msvcCompiler = (Get-Command cl.exe -CommandType Application).Source
+$compiler = $msvcCompiler
+$linker = (Get-Command link.exe -CommandType Application).Source
+$archiver = (Get-Command lib.exe -CommandType Application).Source
 if ($Architecture -eq 'aarch64') {
     $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS = '-Ctarget-feature=+crt-static'
+    # LLVM precedent: https://github.com/wezterm/wezterm/issues/7802.
+    # cc-rs adds --target=aarch64-pc-windows-msvc and /MT for crt-static.
+    # clang-cl assembles libpng's preprocessed .S placeholder without editing
+    # the exact upstream tree; cl ignores it and leaves a missing object.
+    $compiler = Join-Path $env:ProgramFiles 'LLVM/bin/clang-cl.exe'
+    if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+        throw 'Hosted LLVM clang-cl missing'
+    }
+    Invoke-Checked $compiler @('--target=aarch64-pc-windows-msvc', '--version')
+    $env:CC_aarch64_pc_windows_msvc = $compiler
+    $env:CXX_aarch64_pc_windows_msvc = $compiler
+    # Otherwise cc-rs prefers llvm-lib beside clang-cl. Keep MSVC tools/SDK.
+    $env:AR_aarch64_pc_windows_msvc = $archiver
+    $env:CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_LINKER = $linker
 }
-$compiler = (Get-Command cl.exe -CommandType Application).Source
-$linker = (Get-Command link.exe -CommandType Application).Source
 $environment = [ordered]@{}
 foreach ($name in @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCToolsVersion',
                    'WindowsSDKVersion', 'WindowsSdkDir', 'UCRTVersion', 'CC', 'CXX',
@@ -131,7 +147,7 @@ $identity = [ordered]@{
     cargo = (Invoke-Checked cargo @('-vV')) -join "`n"
     image_os = $env:ImageOS
     image_version = $env:ImageVersion
-    native = "$compiler`n$((Get-FileHash $compiler -Algorithm SHA256).Hash)`n$linker`n$((Get-FileHash $linker -Algorithm SHA256).Hash)"
+    native = "$compiler`n$((Get-FileHash $compiler -Algorithm SHA256).Hash)`n$msvcCompiler`n$((Get-FileHash $msvcCompiler -Algorithm SHA256).Hash)`n$linker`n$((Get-FileHash $linker -Algorithm SHA256).Hash)`n$archiver`n$((Get-FileHash $archiver -Algorithm SHA256).Hash)"
     environment = $environment
 }
 [IO.File]::WriteAllText((Join-Path $root '.build-identity.json'),
@@ -168,14 +184,17 @@ Push-Location candidate
 try {
     Invoke-Checked cargo @('vendor', '--locked', '--versioned-dirs') |
         Out-File -Append -Encoding utf8 .cargo/config.toml
-    # Restore only dependency reuse, not workspace freshness. Cargo clean removes
-    # both release/debug workspace fingerprints, build scripts and final EXEs.
+    # Restore only dependency reuse, not workspace freshness. Clean both profiles
+    # explicitly, including workspace fingerprints and build scripts.
     # This includes wezterm-version (.tag) and local/submodule path dependencies.
     $metadata = (Invoke-Checked cargo @('metadata', '--locked', '--format-version', '1')) |
         ConvertFrom-Json
     foreach ($package in $metadata.packages) {
         if ($null -eq $package.source) {
-            Invoke-Checked cargo @('clean', '--package', $package.id)
+            $cleanArgs = @('clean', '--package', $package.id)
+            if ($Architecture -eq 'aarch64') { $cleanArgs += @('--target', $target) }
+            Invoke-Checked cargo ($cleanArgs + @('--profile', 'dev'))
+            Invoke-Checked cargo ($cleanArgs + @('--release'))
         }
     }
     $releaseDir = if ($Architecture -eq 'aarch64') {
@@ -183,7 +202,16 @@ try {
     } else {
         'target/release'
     }
+    # Published aliases restored without Cargo's matching metadata can survive
+    # package cleanup. Remove only our known outputs; never reuse EXEs or PDBs.
+    $outputDirs = @('target/debug', 'target/release', "target/$target/debug", "target/$target/release")
     foreach ($exe in @('wezterm', 'wezterm-gui', 'wezterm-mux-server', 'strip-ansi-escapes')) {
+        foreach ($directory in $outputDirs) {
+            foreach ($extension in @('exe', 'pdb', 'd')) {
+                $output = "$directory/$exe.$extension"
+                if (Test-Path -LiteralPath $output) { Remove-Item -LiteralPath $output -Force }
+            }
+        }
         if (Test-Path "$releaseDir/$exe.exe") { throw "Stale workspace executable: $exe" }
     }
     $buildArgs = @('build', '--locked', '--release', '-p', 'wezterm', '-p', 'wezterm-gui',
